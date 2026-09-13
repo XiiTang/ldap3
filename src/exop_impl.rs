@@ -5,6 +5,7 @@ mod whoami;
 pub use self::whoami::{WhoAmI, WhoAmIResp};
 
 mod starttls;
+#[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 pub use self::starttls::StartTLS;
 
 mod passmod;

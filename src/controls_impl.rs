@@ -1,7 +1,8 @@
+use lber::common::TagClass;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use lber::structure::{PL, StructureTag};
+use lber::structure::StructureTag;
 use lber::structures::{ASNTag, Boolean, OctetString, Sequence, Tag};
 use lber::universal::Types;
 
@@ -202,37 +203,52 @@ pub fn build_tag(rc: RawControl) -> StructureTag {
 }
 
 pub fn parse_controls(t: StructureTag) -> Vec<Control> {
-    let tags = t.expect_constructed().expect("result sequence").into_iter();
+    try_parse_controls(t).expect("invalid LDAP controls")
+}
+
+pub(crate) fn try_parse_controls(t: StructureTag) -> std::io::Result<Vec<Control>> {
+    let malformed =
+        || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid LDAP controls");
+    if t.class != TagClass::Context || t.id != 0 {
+        return Err(malformed());
+    }
+    let tags = t.expect_constructed().ok_or_else(malformed)?;
     let mut ctrls = Vec::new();
     for ctrl in tags {
-        let mut components = ctrl.expect_constructed().expect("components").into_iter();
-        let ctype = String::from_utf8(
-            components
-                .next()
-                .expect("element")
-                .expect_primitive()
-                .expect("octet string"),
-        )
-        .expect("control type");
+        if ctrl.class != TagClass::Universal || ctrl.id != Types::Sequence as u64 {
+            return Err(malformed());
+        }
+        let mut components = ctrl.expect_constructed().ok_or_else(malformed)?.into_iter();
+        let ctype = components.next().ok_or_else(malformed)?;
+        if ctype.class != TagClass::Universal || ctype.id != Types::OctetString as u64 {
+            return Err(malformed());
+        }
+        let ctype = String::from_utf8(ctype.expect_primitive().ok_or_else(malformed)?)
+            .map_err(|_| malformed())?;
         let next = components.next();
-        let (crit, maybe_val) = match next {
-            None => (false, None),
-            Some(c) => match c {
-                StructureTag {
-                    id, ref payload, ..
-                } if id == Types::Boolean as u64 => match *payload {
-                    PL::P(ref v) => (v[0] != 0, components.next()),
-                    PL::C(_) => panic!("decoding error"),
-                },
-                StructureTag { id, .. } if id == Types::OctetString as u64 => {
-                    (false, Some(c.clone()))
+        let (crit, value) = match next {
+            Some(c) if c.class == TagClass::Universal && c.id == Types::Boolean as u64 => {
+                let v = c.expect_primitive().ok_or_else(malformed)?;
+                if v.len() != 1 {
+                    return Err(malformed());
                 }
-                _ => panic!("decoding error"),
-            },
+                (v[0] != 0, components.next())
+            }
+            v => (false, v),
         };
-        let val = maybe_val.map(|v| v.expect_primitive().expect("octet string"));
+        let val = value
+            .map(|v| {
+                if v.class != TagClass::Universal || v.id != Types::OctetString as u64 {
+                    return Err(malformed());
+                }
+                v.expect_primitive().ok_or_else(malformed)
+            })
+            .transpose()?;
+        if components.next().is_some() {
+            return Err(malformed());
+        }
         let known_type = CONTROLS.get(&*ctype).copied();
         ctrls.push(Control(known_type, RawControl { ctype, crit, val }));
     }
-    ctrls
+    Ok(ctrls)
 }

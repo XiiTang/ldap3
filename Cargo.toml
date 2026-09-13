@@ -17,6 +17,7 @@ features = ["sync", "tls", "gssapi", "ntlm"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+zeroize = "1.8"
 tokio = { version = "1.47.1", features = ["macros", "io-util", "sync", "time", "net"] }
 tokio-util = { version = "0.7.16", features = ["codec"] }
 tokio-stream = "0.1.17"

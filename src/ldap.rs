@@ -9,15 +9,13 @@ use crate::RequestId;
 use crate::adapters::{EntriesOnly, IntoAdapterVec};
 use crate::controls_impl::IntoRawControlVec;
 use crate::exop::Exop;
-use crate::exop_impl::construct_exop;
 use crate::protocol::{LdapOp, MaybeControls, MiscSender, ResultSender};
 use crate::result::{
     CompareResult, ExopResult, LdapError, LdapResult, LdapResultExt, Result, SearchResult,
 };
 use crate::search::{Scope, SearchOptions, SearchStream};
 
-use lber::common::TagClass;
-use lber::structures::{Boolean, Enumerated, Integer, Null, OctetString, Sequence, Set, Tag};
+use lber::structures::Tag;
 
 #[cfg(feature = "gssapi")]
 use cross_krb5::{ClientCtx, Cred, InitiateFlags, K5Ctx, Step};
@@ -114,35 +112,7 @@ impl Clone for Ldap {
 }
 
 fn sasl_bind_req(mech: &str, creds: Option<&[u8]>) -> Tag {
-    let mut inner_vec = vec![Tag::OctetString(OctetString {
-        inner: Vec::from(mech),
-        ..Default::default()
-    })];
-    if let Some(creds) = creds {
-        inner_vec.push(Tag::OctetString(OctetString {
-            inner: creds.to_vec(),
-            ..Default::default()
-        }));
-    }
-    Tag::Sequence(Sequence {
-        id: 0,
-        class: TagClass::Application,
-        inner: vec![
-            Tag::Integer(Integer {
-                inner: 3,
-                ..Default::default()
-            }),
-            Tag::OctetString(OctetString {
-                inner: Vec::new(),
-                ..Default::default()
-            }),
-            Tag::Sequence(Sequence {
-                id: 3,
-                class: TagClass::Context,
-                inner: inner_vec,
-            }),
-        ],
-    })
+    crate::requests::sasl_bind(mech, creds.map(Vec::from))
 }
 
 #[cfg(feature = "gssapi")]
@@ -152,27 +122,14 @@ enum GssapiCred {
 }
 
 impl Ldap {
-    fn next_msgid(&mut self) -> i32 {
-        let mut msgmap = self.msgmap.lock().expect("msgmap mutex (inc id)");
-        let last_ldap_id = msgmap.0;
-        let mut next_ldap_id = last_ldap_id;
-        loop {
-            if next_ldap_id == std::i32::MAX {
-                next_ldap_id = 1;
-            } else {
-                next_ldap_id += 1;
-            }
-            if !msgmap.1.contains(&next_ldap_id) {
-                break;
-            }
-            assert_ne!(
-                next_ldap_id, last_ldap_id,
-                "LDAP message id wraparound with no free slots"
-            );
-        }
-        msgmap.0 = next_ldap_id;
-        msgmap.1.insert(next_ldap_id);
-        next_ldap_id
+    pub(crate) fn next_msgid(&mut self) -> std::io::Result<i32> {
+        let mut ids = self.msgmap.lock().expect("msgmap mutex (inc id)");
+        let id = ids.0.checked_add(1).filter(|id| *id > 0).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "LDAP message ID space exhausted")
+        })?;
+        ids.0 = id;
+        ids.1.insert(id);
+        Ok(id)
     }
 
     pub(crate) async fn op_call(
@@ -180,7 +137,7 @@ impl Ldap {
         op: LdapOp,
         req: Tag,
     ) -> Result<(LdapResult, Exop, SaslCreds)> {
-        let id = self.next_msgid();
+        let id = self.next_msgid()?;
         self.last_id = id;
         let (tx, rx) = oneshot::channel();
         self.tx.send((id, op, req, self.controls.take(), tx))?;
@@ -243,25 +200,8 @@ impl Ldap {
 
     /// Do a simple Bind with the provided DN (`bind_dn`) and password (`bind_pw`).
     pub async fn simple_bind(&mut self, bind_dn: &str, bind_pw: &str) -> Result<LdapResult> {
-        let req = Tag::Sequence(Sequence {
-            id: 0,
-            class: TagClass::Application,
-            inner: vec![
-                Tag::Integer(Integer {
-                    inner: 3,
-                    ..Default::default()
-                }),
-                Tag::OctetString(OctetString {
-                    inner: Vec::from(bind_dn),
-                    ..Default::default()
-                }),
-                Tag::OctetString(OctetString {
-                    id: 0,
-                    class: TagClass::Context,
-                    inner: Vec::from(bind_pw),
-                }),
-            ],
-        });
+        let req =
+            crate::requests::simple_bind(bind_dn.as_bytes().to_vec(), bind_pw.as_bytes().to_vec());
         Ok(self.op_call(LdapOp::Single, req).await?.0)
     }
 
@@ -593,52 +533,21 @@ impl Ldap {
         dn: &str,
         attrs: Vec<(S, HashSet<S>)>,
     ) -> Result<LdapResult> {
-        let mut any_empty = false;
-        let req = Tag::Sequence(Sequence {
-            id: 8,
-            class: TagClass::Application,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: Vec::from(dn.as_bytes()),
-                    ..Default::default()
-                }),
-                Tag::Sequence(Sequence {
-                    inner: attrs
-                        .into_iter()
-                        .map(|(name, vals)| {
-                            if vals.is_empty() {
-                                any_empty = true;
-                            }
-                            Tag::Sequence(Sequence {
-                                inner: vec![
-                                    Tag::OctetString(OctetString {
-                                        inner: Vec::from(name.as_ref()),
-                                        ..Default::default()
-                                    }),
-                                    Tag::Set(Set {
-                                        inner: vals
-                                            .into_iter()
-                                            .map(|v| {
-                                                Tag::OctetString(OctetString {
-                                                    inner: Vec::from(v.as_ref()),
-                                                    ..Default::default()
-                                                })
-                                            })
-                                            .collect(),
-                                        ..Default::default()
-                                    }),
-                                ],
-                                ..Default::default()
-                            })
-                        })
-                        .collect(),
-                    ..Default::default()
-                }),
-            ],
-        });
-        if any_empty {
+        if attrs.iter().any(|(_, values)| values.is_empty()) {
             return Err(LdapError::AddNoValues);
         }
+        let req = crate::requests::add(
+            dn.as_bytes().to_vec(),
+            attrs
+                .into_iter()
+                .map(|(name, values)| {
+                    (
+                        name.as_ref().to_vec(),
+                        values.into_iter().map(|v| v.as_ref().to_vec()).collect(),
+                    )
+                })
+                .collect(),
+        );
         Ok(self.op_call(LdapOp::Single, req).await?.0)
     }
 
@@ -653,39 +562,17 @@ impl Ldap {
         attr: &str,
         val: B,
     ) -> Result<CompareResult> {
-        let req = Tag::Sequence(Sequence {
-            id: 14,
-            class: TagClass::Application,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: Vec::from(dn.as_bytes()),
-                    ..Default::default()
-                }),
-                Tag::Sequence(Sequence {
-                    inner: vec![
-                        Tag::OctetString(OctetString {
-                            inner: Vec::from(attr.as_bytes()),
-                            ..Default::default()
-                        }),
-                        Tag::OctetString(OctetString {
-                            inner: Vec::from(val.as_ref()),
-                            ..Default::default()
-                        }),
-                    ],
-                    ..Default::default()
-                }),
-            ],
-        });
+        let req = crate::requests::compare(
+            dn.as_bytes().to_vec(),
+            attr.as_bytes().to_vec(),
+            val.as_ref().to_vec(),
+        );
         Ok(CompareResult(self.op_call(LdapOp::Single, req).await?.0))
     }
 
     /// Delete an entry named by `dn`.
     pub async fn delete(&mut self, dn: &str) -> Result<LdapResult> {
-        let req = Tag::OctetString(OctetString {
-            id: 10,
-            class: TagClass::Application,
-            inner: Vec::from(dn.as_bytes()),
-        });
+        let req = crate::requests::delete(dn.as_bytes().to_vec());
         Ok(self.op_call(LdapOp::Single, req).await?.0)
     }
 
@@ -696,70 +583,29 @@ impl Ldap {
         dn: &str,
         mods: Vec<Mod<S>>,
     ) -> Result<LdapResult> {
-        let mut any_add_empty = false;
-        let req = Tag::Sequence(Sequence {
-            id: 6,
-            class: TagClass::Application,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: Vec::from(dn.as_bytes()),
-                    ..Default::default()
-                }),
-                Tag::Sequence(Sequence {
-                    inner: mods
-                        .into_iter()
-                        .map(|m| {
-                            let mut is_add = false;
-                            let (num, attr, set) = match m {
-                                Mod::Add(attr, set) => {
-                                    is_add = true;
-                                    (0, attr, set)
-                                }
-                                Mod::Delete(attr, set) => (1, attr, set),
-                                Mod::Replace(attr, set) => (2, attr, set),
-                                Mod::Increment(attr, val) => (3, attr, HashSet::from([val])),
-                            };
-                            if set.is_empty() && is_add {
-                                any_add_empty = true;
-                            }
-                            let op = Tag::Enumerated(Enumerated {
-                                inner: num,
-                                ..Default::default()
-                            });
-                            let part_attr = Tag::Sequence(Sequence {
-                                inner: vec![
-                                    Tag::OctetString(OctetString {
-                                        inner: Vec::from(attr.as_ref()),
-                                        ..Default::default()
-                                    }),
-                                    Tag::Set(Set {
-                                        inner: set
-                                            .into_iter()
-                                            .map(|val| {
-                                                Tag::OctetString(OctetString {
-                                                    inner: Vec::from(val.as_ref()),
-                                                    ..Default::default()
-                                                })
-                                            })
-                                            .collect(),
-                                        ..Default::default()
-                                    }),
-                                ],
-                                ..Default::default()
-                            });
-                            Tag::Sequence(Sequence {
-                                inner: vec![op, part_attr],
-                                ..Default::default()
-                            })
-                        })
-                        .collect(),
-                    ..Default::default()
-                }),
-            ],
-        });
-        if any_add_empty {
-            return Err(LdapError::AddNoValues);
+        let mut changes = Vec::with_capacity(mods.len());
+        for modification in mods {
+            use crate::requests::Modification as M;
+            let (kind, name, values) = match modification {
+                Mod::Add(name, values) => {
+                    if values.is_empty() {
+                        return Err(LdapError::AddNoValues);
+                    }
+                    (M::Add, name, values)
+                }
+                Mod::Delete(name, values) => (M::Delete, name, values),
+                Mod::Replace(name, values) => (M::Replace, name, values),
+                Mod::Increment(name, value) => (M::Increment, name, HashSet::from([value])),
+            };
+            changes.push((
+                kind,
+                (
+                    name.as_ref().to_vec(),
+                    values.into_iter().map(|v| v.as_ref().to_vec()).collect(),
+                ),
+            ));
         }
+        let req = crate::requests::modify(dn.as_bytes().to_vec(), changes);
         Ok(self.op_call(LdapOp::Single, req).await?.0)
     }
 
@@ -774,32 +620,12 @@ impl Ldap {
         delete_old: bool,
         new_sup: Option<&str>,
     ) -> Result<LdapResult> {
-        let mut params = vec![
-            Tag::OctetString(OctetString {
-                inner: Vec::from(dn.as_bytes()),
-                ..Default::default()
-            }),
-            Tag::OctetString(OctetString {
-                inner: Vec::from(rdn.as_bytes()),
-                ..Default::default()
-            }),
-            Tag::Boolean(Boolean {
-                inner: delete_old,
-                ..Default::default()
-            }),
-        ];
-        if let Some(new_sup) = new_sup {
-            params.push(Tag::OctetString(OctetString {
-                id: 0,
-                class: TagClass::Context,
-                inner: Vec::from(new_sup.as_bytes()),
-            }));
-        }
-        let req = Tag::Sequence(Sequence {
-            id: 12,
-            class: TagClass::Application,
-            inner: params,
-        });
+        let req = crate::requests::modify_dn(
+            dn.as_bytes().to_vec(),
+            rdn.as_bytes().to_vec(),
+            delete_old,
+            new_sup.map(|v| v.as_bytes().to_vec()),
+        );
         Ok(self.op_call(LdapOp::Single, req).await?.0)
     }
 
@@ -810,11 +636,7 @@ impl Ldap {
     where
         E: Into<Exop>,
     {
-        let req = Tag::Sequence(Sequence {
-            id: 23,
-            class: TagClass::Application,
-            inner: construct_exop(exop.into()),
-        });
+        let req = crate::requests::extended(exop.into());
         self.op_call(LdapOp::Single, req)
             .await
             .map(|et| ExopResult(et.1, et.0))
@@ -822,11 +644,7 @@ impl Ldap {
 
     /// Terminate the connection to the server.
     pub async fn unbind(&mut self) -> Result<()> {
-        let req = Tag::Null(Null {
-            id: 2,
-            class: TagClass::Application,
-            inner: (),
-        });
+        let req = crate::requests::unbind();
         self.op_call(LdapOp::Unbind, req).await.map(|_| ())
     }
 
@@ -842,11 +660,7 @@ impl Ldap {
 
     /// Ask the server to abandon an operation identified by `msgid`.
     pub async fn abandon(&mut self, msgid: RequestId) -> Result<()> {
-        let req = Tag::Integer(Integer {
-            id: 16,
-            class: TagClass::Application,
-            inner: msgid as i64,
-        });
+        let req = crate::requests::abandon(msgid);
         self.op_call(LdapOp::Abandon(msgid), req).await.map(|_| ())
     }
 

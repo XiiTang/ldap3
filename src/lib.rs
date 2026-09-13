@@ -239,14 +239,18 @@ pub mod exop {
 }
 mod filter;
 mod ldap;
+mod raw;
+pub mod requests;
+pub use raw::{DispatchStatus, DriverLimits, RawDispatch, RawEvent, RawHandle, RawResponses};
 mod protocol;
+pub use protocol::{CodecLimits, LdapCodec, RawResponse};
 pub mod result;
 mod search;
 #[cfg(feature = "sync")]
 mod sync;
 mod util;
 
-pub use conn::{LdapConnAsync, LdapConnSettings, StdStream};
+pub use conn::{AsyncStream, LdapConnAsync, LdapConnSettings, StdStream};
 pub use filter::parse as parse_filter;
 pub use ldap::{Ldap, Mod};
 pub use result::{LdapError, LdapResult, SearchResult};

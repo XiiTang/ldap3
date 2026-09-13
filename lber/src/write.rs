@@ -7,34 +7,78 @@ use std::io::{self, Write};
 
 /// BER-encode a tag structure into the provided buffer.
 pub fn encode_into(buf: &mut BytesMut, tag: StructureTag) -> io::Result<()> {
-    let mut tag_vec = Vec::new();
-    encode_inner(&mut tag_vec, tag)?;
-    buf.extend(tag_vec);
+    let size = encoded_size(&tag, 0)?;
+    // Admit before mutating the destination. One output allocation replaces
+    // recursively materialized copies of every enclosing BER sequence.
+    buf.reserve(size);
+    encode_inner(buf, tag)?;
     Ok(())
 }
-
-fn encode_inner(buf: &mut Vec<u8>, tag: StructureTag) -> io::Result<()> {
-    let structure = match tag.payload {
+fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "BER encoding size or depth exceeded",
+    )
+}
+fn encoded_size(tag: &StructureTag, depth: usize) -> io::Result<usize> {
+    if depth > 128 {
+        return Err(invalid());
+    }
+    let payload = match &tag.payload {
+        PL::P(v) => v.len(),
+        PL::C(v) => {
+            let mut n = 0usize;
+            for tag in v {
+                n = n
+                    .checked_add(encoded_size(tag, depth + 1)?)
+                    .ok_or_else(invalid)?;
+            }
+            n
+        }
+    };
+    let tag_bytes = if tag.id < 31 {
+        1
+    } else {
+        1 + (64 - tag.id.leading_zeros()).div_ceil(7) as usize
+    };
+    let length_bytes = if payload < 128 {
+        1
+    } else {
+        1 + (usize::BITS - payload.leading_zeros()).div_ceil(8) as usize
+    };
+    payload
+        .checked_add(tag_bytes + length_bytes)
+        .ok_or_else(invalid)
+}
+fn encode_inner(buf: &mut BytesMut, tag: StructureTag) -> io::Result<()> {
+    let structure = match &tag.payload {
         PL::P(_) => TagStructure::Primitive,
         PL::C(_) => TagStructure::Constructed,
     };
-
-    write_type(buf, tag.class, structure, tag.id);
+    // Small headers contain only type and length, never payload or credentials.
+    let mut header = Vec::with_capacity(24);
+    write_type(&mut header, tag.class, structure, tag.id);
     match tag.payload {
         PL::P(v) => {
-            write_length(buf, v.len());
-            buf.extend(v);
+            let bytes = zeroize::Zeroizing::new(v);
+            write_length(&mut header, bytes.len());
+            buf.extend_from_slice(&header);
+            buf.extend_from_slice(&bytes);
         }
         PL::C(tags) => {
-            let mut tmp = Vec::new();
-            for tag in tags {
-                encode_inner(&mut tmp, tag)?;
+            let mut size = 0usize;
+            for tag in &tags {
+                size = size
+                    .checked_add(encoded_size(tag, 0)?)
+                    .ok_or_else(invalid)?;
             }
-            write_length(buf, tmp.len());
-            buf.extend(tmp);
+            write_length(&mut header, size);
+            buf.extend_from_slice(&header);
+            for tag in tags {
+                encode_inner(buf, tag)?;
+            }
         }
-    };
-
+    }
     Ok(())
 }
 

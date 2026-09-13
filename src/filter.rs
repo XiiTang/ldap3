@@ -45,12 +45,8 @@ const AND_FILT: u64 = 0;
 const OR_FILT: u64 = 1;
 const NOT_FILT: u64 = 2;
 
-const EQ_MATCH: u64 = 3;
 const SUBSTR_MATCH: u64 = 4;
-const GTE_MATCH: u64 = 5;
-const LTE_MATCH: u64 = 6;
 const PRES_MATCH: u64 = 7;
-const APPROX_MATCH: u64 = 8;
 const EXT_MATCH: u64 = 9;
 
 const SUB_INITIAL: u64 = 0;
@@ -90,36 +86,100 @@ fn mv_filterlist(i: &[u8]) -> IResult<&[u8], Tag> {
     })(i)
 }
 
+pub fn conjunction(tags: Vec<Tag>) -> Tag {
+    Tag::Sequence(Sequence {
+        class: TagClass::Context,
+        id: AND_FILT,
+        inner: tags,
+    })
+}
+pub fn disjunction(tags: Vec<Tag>) -> Tag {
+    Tag::Sequence(Sequence {
+        class: TagClass::Context,
+        id: OR_FILT,
+        inner: tags,
+    })
+}
+pub fn negation(tag: Tag) -> Tag {
+    Tag::ExplicitTag(ExplicitTag {
+        class: TagClass::Context,
+        id: NOT_FILT,
+        inner: Box::new(tag),
+    })
+}
 fn and(i: &[u8]) -> IResult<&[u8], Tag> {
-    map(preceded(tag(b"&"), filterlist), |tagv: Vec<Tag>| -> Tag {
-        Tag::Sequence(Sequence {
-            class: TagClass::Context,
-            id: AND_FILT,
-            inner: tagv,
-        })
-    })(i)
+    map(preceded(tag(b"&"), filterlist), conjunction)(i)
 }
-
 fn or(i: &[u8]) -> IResult<&[u8], Tag> {
-    map(preceded(tag(b"|"), filterlist), |tagv: Vec<Tag>| -> Tag {
-        Tag::Sequence(Sequence {
-            class: TagClass::Context,
-            id: OR_FILT,
-            inner: tagv,
-        })
-    })(i)
+    map(preceded(tag(b"|"), filterlist), disjunction)(i)
 }
-
 fn not(i: &[u8]) -> IResult<&[u8], Tag> {
-    map(preceded(tag(b"!"), filter), |tag: Tag| -> Tag {
-        Tag::ExplicitTag(ExplicitTag {
-            class: TagClass::Context,
-            id: NOT_FILT,
-            inner: Box::new(tag),
-        })
-    })(i)
+    map(preceded(tag(b"!"), filter), negation)(i)
 }
-
+#[derive(Clone, Copy)]
+pub enum Comparison {
+    Equal = 3,
+    GreaterOrEqual = 5,
+    LessOrEqual = 6,
+    Approximate = 8,
+}
+pub fn assertion(kind: Comparison, attribute: Vec<u8>, value: Vec<u8>) -> Tag {
+    Tag::Sequence(Sequence {
+        class: TagClass::Context,
+        id: kind as u64,
+        inner: vec![
+            Tag::OctetString(OctetString {
+                inner: attribute,
+                ..Default::default()
+            }),
+            Tag::OctetString(OctetString {
+                inner: value,
+                ..Default::default()
+            }),
+        ],
+    })
+}
+pub fn presence(attribute: Vec<u8>) -> Tag {
+    Tag::OctetString(OctetString {
+        class: TagClass::Context,
+        id: PRES_MATCH,
+        inner: attribute,
+    })
+}
+pub fn substring(
+    attribute: Vec<u8>,
+    initial: Option<Vec<u8>>,
+    any: Vec<Vec<u8>>,
+    final_value: Option<Vec<u8>>,
+) -> Tag {
+    let mut parts = Vec::new();
+    for (id, value) in initial
+        .into_iter()
+        .map(|v| (SUB_INITIAL, v))
+        .chain(any.into_iter().map(|v| (SUB_ANY, v)))
+        .chain(final_value.into_iter().map(|v| (SUB_FINAL, v)))
+    {
+        parts.push(Tag::OctetString(OctetString {
+            class: TagClass::Context,
+            id,
+            inner: value,
+        }));
+    }
+    Tag::Sequence(Sequence {
+        class: TagClass::Context,
+        id: SUBSTR_MATCH,
+        inner: vec![
+            Tag::OctetString(OctetString {
+                inner: attribute,
+                ..Default::default()
+            }),
+            Tag::Sequence(Sequence {
+                inner: parts,
+                ..Default::default()
+            }),
+        ],
+    })
+}
 fn item(i: &[u8]) -> IResult<&[u8], Tag> {
     alt((eq, non_eq, extensible))(i)
 }
@@ -207,30 +267,13 @@ fn non_eq(i: &[u8]) -> IResult<&[u8], Tag> {
     let (i, attr) = attributedescription(i)?;
     let (i, filterop) = alt((tag(b">="), tag(b"<="), tag("~=")))(i)?;
     let (i, value) = unescaped(i)?;
-    let tag = Tag::Sequence(Sequence {
-        class: TagClass::Context,
-        id: filtertag(filterop),
-        inner: vec![
-            Tag::OctetString(OctetString {
-                inner: attr.to_vec(),
-                ..Default::default()
-            }),
-            Tag::OctetString(OctetString {
-                inner: value,
-                ..Default::default()
-            }),
-        ],
-    });
+    let kind = match filterop {
+        b">=" => Comparison::GreaterOrEqual,
+        b"<=" => Comparison::LessOrEqual,
+        _ => Comparison::Approximate,
+    };
+    let tag = assertion(kind, attr.to_vec(), value);
     Ok((i, tag))
-}
-
-fn filtertag(filterop: &[u8]) -> u64 {
-    match filterop {
-        b">=" => GTE_MATCH,
-        b"<=" => LTE_MATCH,
-        b"~=" => APPROX_MATCH,
-        _ => unimplemented!(),
-    }
 }
 
 fn eq(i: &[u8]) -> IResult<&[u8], Tag> {
@@ -250,63 +293,18 @@ fn eq(i: &[u8]) -> IResult<&[u8], Tag> {
         },
     )(i)?;
     let tag = if mid_final.is_empty() {
-        // simple equality, no asterisks in assertion value
-        Tag::Sequence(Sequence {
-            class: TagClass::Context,
-            id: EQ_MATCH,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: attr.to_vec(),
-                    ..Default::default()
-                }),
-                Tag::OctetString(OctetString {
-                    inner: initial,
-                    ..Default::default()
-                }),
-            ],
-        })
+        assertion(Comparison::Equal, attr.to_vec(), initial)
     } else if initial.is_empty() && mid_final.len() == 1 && mid_final[0].is_empty() {
-        // presence, single asterisk in assertion value
-        Tag::OctetString(OctetString {
-            class: TagClass::Context,
-            id: PRES_MATCH,
-            inner: attr.to_vec(),
-        })
+        presence(attr.to_vec())
     } else {
-        // substring match
-        let mut inner = vec![];
-        if !initial.is_empty() {
-            inner.push(Tag::OctetString(OctetString {
-                class: TagClass::Context,
-                id: SUB_INITIAL,
-                inner: initial,
-            }));
-        }
-        let n = mid_final.len();
-        for (i, sub_elem) in mid_final.into_iter().enumerate() {
-            if sub_elem.is_empty() {
-                break;
-            }
-            inner.push(Tag::OctetString(OctetString {
-                class: TagClass::Context,
-                id: if i + 1 != n { SUB_ANY } else { SUB_FINAL },
-                inner: sub_elem,
-            }));
-        }
-        Tag::Sequence(Sequence {
-            class: TagClass::Context,
-            id: SUBSTR_MATCH,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: attr.to_vec(),
-                    ..Default::default()
-                }),
-                Tag::Sequence(Sequence {
-                    inner,
-                    ..Default::default()
-                }),
-            ],
-        })
+        let initial = if initial.is_empty() {
+            None
+        } else {
+            Some(initial)
+        };
+        let mut parts = mid_final;
+        let final_value = parts.pop().filter(|v| !v.is_empty());
+        substring(attr.to_vec(), initial, parts, final_value)
     };
     Ok((i, tag))
 }
@@ -332,7 +330,7 @@ fn dn_mrule(i: &[u8]) -> IResult<&[u8], Tag> {
     Ok((i, extensible_tag(Some(mrule), None, value, dn.is_some())))
 }
 
-fn extensible_tag(mrule: Option<&[u8]>, attr: Option<&[u8]>, value: Vec<u8>, dn: bool) -> Tag {
+pub fn extensible_tag(mrule: Option<&[u8]>, attr: Option<&[u8]>, value: Vec<u8>, dn: bool) -> Tag {
     let mut inner = vec![];
     if let Some(mrule) = mrule {
         inner.push(Tag::OctetString(OctetString {

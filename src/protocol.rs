@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::RequestId;
 use crate::controls::{Control, RawControl};
-use crate::controls_impl::{build_tag, parse_controls};
+use crate::controls_impl::{build_tag, try_parse_controls};
 use crate::search::SearchItem;
 
 use lber::common::TagClass;
@@ -16,13 +16,42 @@ use lber::structures::{ASNTag, Integer, Sequence, Tag};
 use lber::universal::Types;
 use lber::write;
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 #[cfg(feature = "gssapi")]
 use cross_krb5::{ClientCtx, K5Ctx};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Decoder, Encoder};
 
-pub(crate) struct LdapCodec {
+/// Limits used by the single library BER decoder before allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct CodecLimits {
+    pub maximum_frame: usize,
+    pub maximum_allocation: usize,
+    pub maximum_nodes: usize,
+    pub maximum_depth: usize,
+}
+impl Default for CodecLimits {
+    fn default() -> Self {
+        Self {
+            maximum_frame: 16 * 1024 * 1024,
+            maximum_allocation: 64 * 1024 * 1024,
+            maximum_nodes: 65536,
+            maximum_depth: 64,
+        }
+    }
+}
+/// Exact envelope evidence and the parsed operation. No numeric result code is
+/// converted to a closed enum or interpreted as business success here.
+pub struct RawResponse {
+    pub id: RequestId,
+    pub operation: StructureTag,
+    pub controls: Vec<Control>,
+    pub raw: Bytes,
+}
+
+#[derive(Clone)]
+pub struct LdapCodec {
+    limits: CodecLimits,
     #[cfg(feature = "gssapi")]
     pub(crate) has_decoded_data: bool,
     #[cfg(feature = "gssapi")]
@@ -43,85 +72,134 @@ pub enum MiscSender {
 
 #[derive(Debug)]
 pub enum LdapOp {
+    #[allow(private_interfaces)]
+    Raw(crate::raw::RawOperation),
     Single,
     Search(ItemSender),
     Abandon(RequestId),
     Unbind,
 }
 
-#[allow(clippy::type_complexity)]
-fn decode_inner(buf: &mut BytesMut) -> Result<Option<(RequestId, (Tag, Vec<Control>))>, io::Error> {
-    let decoding_error = io::Error::new(io::ErrorKind::Other, "decoding error");
-    let mut parser = lber::Parser::new();
-    let binding = parser.parse(buf);
-    let (i, tag) = match binding {
-        Err(e) if e.is_incomplete() => return Ok(None),
-        Err(_e) => return Err(decoding_error),
-        Ok((i, ref tag)) => (i, tag),
-    };
-    buf.advance(buf.len() - i.len());
-    let tag = tag.clone();
-    let mut tags = match tag
-        .match_id(Types::Sequence as u64)
-        .and_then(|t| t.expect_constructed())
-    {
-        Some(tags) => tags,
-        None => return Err(decoding_error),
-    };
-    let mut maybe_controls = tags.pop().expect("element");
-    let has_controls = match maybe_controls {
-        StructureTag {
-            id,
-            class,
-            ref payload,
-        } if class == TagClass::Context && id == 0 => match *payload {
-            PL::C(_) => true,
-            PL::P(_) => return Err(decoding_error),
-        },
-        StructureTag { id, class, .. } if class == TagClass::Context && id == 10 => {
-            // Active Directory bug workaround
-            //
-            // AD incorrectly encodes Notice of Disconnection messages. The OID of the
-            // Unsolicited Notification should be part of the ExtendedResponse sequence
-            // but AD puts it outside, where the optional controls belong. This confuses
-            // our parser, which doesn't expect the extra sequence element at the end
-            // and crashes. This match arm thus ignores the element.
-            maybe_controls = tags.pop().expect("element");
-            false
+impl LdapCodec {
+    pub fn validate_request(
+        &self,
+        operation: &StructureTag,
+        controls: &[RawControl],
+    ) -> io::Result<usize> {
+        request_allocation(operation, controls, self.limits)
+    }
+    pub fn new(limits: CodecLimits) -> io::Result<Self> {
+        if limits.maximum_frame < 2
+            || limits.maximum_allocation == 0
+            || limits.maximum_nodes == 0
+            || limits.maximum_depth == 0
+            || limits.maximum_depth > 128
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid LDAP codec limits",
+            ));
         }
-        _ => false,
-    };
-    let (protoop, controls) = if has_controls {
-        (tags.pop().expect("element"), Some(maybe_controls))
+        Ok(Self {
+            limits,
+            #[cfg(feature = "gssapi")]
+            has_decoded_data: false,
+            #[cfg(feature = "gssapi")]
+            sasl_param: Arc::new(RwLock::new((false, 0))),
+            #[cfg(feature = "gssapi")]
+            client_ctx: Arc::new(Mutex::new(None)),
+        })
+    }
+}
+
+fn invalid() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid LDAP envelope")
+}
+fn decode_inner(buf: &mut BytesMut, limits: CodecLimits) -> io::Result<Option<RawResponse>> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    if buf[0] != 0x30 {
+        return Err(invalid());
+    }
+    let (header, payload) = if buf[1] < 128 {
+        (2, buf[1] as usize)
     } else {
-        (maybe_controls, None)
+        let n = (buf[1] & 127) as usize;
+        if n == 0 || n > std::mem::size_of::<usize>() {
+            return Err(invalid());
+        }
+        if buf.len() < 2 + n {
+            return Ok(None);
+        }
+        let mut len = 0usize;
+        for byte in &buf[2..2 + n] {
+            len = len
+                .checked_mul(256)
+                .and_then(|n| n.checked_add(*byte as usize))
+                .ok_or_else(invalid)?;
+        }
+        (2 + n, len)
     };
-    let controls = match controls {
-        Some(controls) => parse_controls(controls),
-        None => vec![],
-    };
-    let msgid = match parse_uint(
-        tags.pop()
-            .expect("element")
-            .match_class(TagClass::Universal)
-            .and_then(|t| t.match_id(Types::Integer as u64))
-            .and_then(|t| t.expect_primitive())
-            .expect("message id")
-            .as_slice(),
-    ) {
-        Ok((_, id)) => id as i32,
-        _ => return Err(decoding_error),
-    };
-    Ok(Some((msgid, (Tag::StructureTag(protoop), controls))))
+    let length = header.checked_add(payload).ok_or_else(invalid)?;
+    if length > limits.maximum_frame {
+        return Err(invalid());
+    }
+    if buf.len() < length {
+        return Ok(None);
+    }
+    let (tail, tag) = lber::parse::parse_tag_limited(
+        &buf[..length],
+        limits.maximum_depth,
+        limits.maximum_nodes,
+        limits.maximum_allocation,
+    )
+    .map_err(|_| invalid())?;
+    if !tail.is_empty() {
+        return Err(invalid());
+    }
+    let mut tags = tag.expect_constructed().ok_or_else(invalid)?.into_iter();
+    let id = tags.next().ok_or_else(invalid)?;
+    if id.class != TagClass::Universal || id.id != Types::Integer as u64 {
+        return Err(invalid());
+    }
+    let id = id.expect_primitive().ok_or_else(invalid)?;
+    if id.is_empty() || id.len() > 4 || id[0] & 128 != 0 {
+        return Err(invalid());
+    }
+    let id = parse_uint(&id).map_err(|_| invalid())?.1;
+    if id > i32::MAX as u64 {
+        return Err(invalid());
+    }
+    let operation = tags.next().ok_or_else(invalid)?;
+    if operation.class != TagClass::Application {
+        return Err(invalid());
+    }
+    let controls = tags
+        .next()
+        .map(try_parse_controls)
+        .transpose()?
+        .unwrap_or_default();
+    if tags.next().is_some() {
+        return Err(invalid());
+    }
+    let raw = Bytes::copy_from_slice(&buf[..length]);
+    buf.advance(length);
+    Ok(Some(RawResponse {
+        id: id as i32,
+        operation,
+        controls,
+        raw,
+    }))
 }
 
 impl Decoder for LdapCodec {
-    type Item = (RequestId, (Tag, Vec<Control>));
+    type Item = RawResponse;
     type Error = io::Error;
 
     #[cfg(not(feature = "gssapi"))]
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        decode_inner(buf)
+        decode_inner(buf, self.limits)
     }
 
     #[cfg(feature = "gssapi")]
@@ -130,19 +208,22 @@ impl Decoder for LdapCodec {
 
         let sasl_wrap = { self.sasl_param.read().expect("sasl param").0 };
         if !sasl_wrap || buf.is_empty() {
-            return decode_inner(buf);
+            return decode_inner(buf, self.limits);
         }
         if self.has_decoded_data {
-            let res = decode_inner(buf);
+            let res = decode_inner(buf, self.limits);
             if res.is_ok() && buf.is_empty() {
                 self.has_decoded_data = false;
             }
             return res;
         }
         if buf.len() < U32_SIZE {
-            return Err(io::Error::new(io::ErrorKind::Other, "invalid SASL buffer"));
+            return Ok(None);
         }
         let sasl_len = u32::from_be_bytes(buf[0..U32_SIZE].try_into().unwrap());
+        if sasl_len as usize > self.limits.maximum_frame {
+            return Err(invalid());
+        }
         if buf.len() - U32_SIZE < sasl_len as usize {
             return Ok(None);
         }
@@ -152,7 +233,7 @@ impl Decoder for LdapCodec {
         let mut decoded = client_ctx.unwrap_iov(sasl_len as usize, buf).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("gss_unwrap error: {:#}", e))
         })?;
-        let res = decode_inner(&mut decoded);
+        let res = decode_inner(&mut decoded, self.limits);
         if res.is_ok() && !decoded.is_empty() && buf.is_empty() {
             buf.extend(decoded);
             self.has_decoded_data = true;
@@ -241,5 +322,132 @@ impl Encoder<(RequestId, Tag, MaybeControls)> for LdapCodec {
         };
         maybe_wrap(self, outstruct, into)?;
         Ok(())
+    }
+}
+
+fn too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "LDAP allocation or frame limit exceeded",
+    )
+}
+fn add(a: usize, b: usize) -> io::Result<usize> {
+    a.checked_add(b).ok_or_else(too_large)
+}
+fn tlv(payload: usize) -> io::Result<usize> {
+    add(
+        payload,
+        if payload < 128 {
+            2
+        } else {
+            2 + (usize::BITS - payload.leading_zeros()).div_ceil(8) as usize
+        },
+    )
+}
+fn footprint(
+    tag: &StructureTag,
+    depth: usize,
+    nodes: &mut usize,
+    limits: CodecLimits,
+) -> io::Result<(usize, usize)> {
+    if depth > limits.maximum_depth || tag.id >= 31 {
+        return Err(too_large());
+    }
+    *nodes = nodes.checked_sub(1).ok_or_else(too_large)?;
+    let (payload, memory) = match &tag.payload {
+        PL::P(bytes) => (bytes.len(), bytes.capacity()),
+        PL::C(children) => {
+            let mut payload = 0;
+            let mut memory = children
+                .capacity()
+                .checked_mul(std::mem::size_of::<StructureTag>())
+                .ok_or_else(too_large)?;
+            for child in children {
+                let (wire, heap) = footprint(child, depth + 1, nodes, limits)?;
+                payload = add(payload, wire)?;
+                memory = add(memory, heap)?;
+            }
+            (payload, memory)
+        }
+    };
+    if memory > limits.maximum_allocation {
+        return Err(too_large());
+    }
+    Ok((tlv(payload)?, memory))
+}
+pub(crate) fn request_allocation(
+    operation: &StructureTag,
+    controls: &[RawControl],
+    limits: CodecLimits,
+) -> io::Result<usize> {
+    let mut nodes = limits.maximum_nodes;
+    let (operation_wire, mut memory) = footprint(operation, 1, &mut nodes, limits)?;
+    // Include the operation, envelope, request bookkeeping and temporary encoder nodes.
+    memory = add(memory, 1024)?;
+    let mut controls_wire = 0;
+    for control in controls {
+        let wire = add(tlv(control.ctype.len())?, 3)?;
+        let wire = add(wire, control.val.as_ref().map_or(Ok(0), |v| tlv(v.len()))?)?;
+        controls_wire = add(controls_wire, tlv(wire)?)?;
+        memory = add(
+            memory,
+            add(
+                512,
+                add(
+                    control.ctype.capacity(),
+                    control.val.as_ref().map_or(0, Vec::capacity),
+                )?,
+            )?,
+        )?;
+    }
+    let wire = tlv(add(
+        add(6, operation_wire)?,
+        if controls.is_empty() {
+            0
+        } else {
+            tlv(controls_wire)?
+        },
+    )?)?;
+    if wire > limits.maximum_frame {
+        return Err(too_large());
+    }
+    // BytesMut may grow geometrically, and framing/tree conversion coexist.
+    memory = add(memory, wire.checked_mul(4).ok_or_else(too_large)?)?;
+    if memory > limits.maximum_allocation {
+        return Err(too_large());
+    }
+    Ok(memory)
+}
+impl RawResponse {
+    pub(crate) fn allocation_bytes(&self) -> io::Result<usize> {
+        let mut nodes = usize::MAX;
+        let (_, heap) = footprint(
+            &self.operation,
+            1,
+            &mut nodes,
+            CodecLimits {
+                maximum_allocation: usize::MAX,
+                maximum_depth: 128,
+                ..Default::default()
+            },
+        )?;
+        let mut size = add(add(heap, self.raw.len())?, std::mem::size_of::<Self>())?;
+        size = add(
+            size,
+            self.controls
+                .capacity()
+                .checked_mul(std::mem::size_of::<Control>())
+                .ok_or_else(too_large)?,
+        )?;
+        for control in &self.controls {
+            size = add(
+                size,
+                add(
+                    control.1.ctype.capacity(),
+                    control.1.val.as_ref().map_or(0, Vec::capacity),
+                )?,
+            )?;
+        }
+        Ok(size)
     }
 }

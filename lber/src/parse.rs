@@ -35,6 +35,12 @@ fn parse_length(i: &[u8]) -> nom::IResult<&[u8], usize> {
         Ok((i, len as usize))
     } else {
         let len = len - 128;
+        if len == 0 || len > 8 {
+            return Err(nom::Err::Failure(Error::from_error_kind(
+                i,
+                ErrorKind::LengthValue,
+            )));
+        }
         let (i, b) = take(len)(i)?;
         let (_, len) = parse_uint(b)?;
         Ok((
@@ -47,18 +53,56 @@ fn parse_length(i: &[u8]) -> nom::IResult<&[u8], usize> {
 
 /// Extract an unsigned integer value from BER data.
 pub fn parse_uint(i: &[u8]) -> nom::IResult<&[u8], u64> {
+    if i.is_empty() || i.len() > 8 {
+        return Err(nom::Err::Failure(Error::from_error_kind(
+            i,
+            ErrorKind::TooLarge,
+        )));
+    }
     Ok((i, i.iter().fold(0, |res, &byte| (res << 8) | byte as u64)))
 }
 
 /// Parse raw BER data into a serializable structure.
 pub fn parse_tag(i: &[u8]) -> nom::IResult<&[u8], StructureTag> {
+    parse_tag_limited(i, 64, 65536, 64 * 1024 * 1024)
+}
+
+/// The same BER parser with explicit recursion, node and allocation admission.
+/// Collection growth is conservatively charged before creating each node.
+pub fn parse_tag_limited(
+    i: &[u8],
+    depth: usize,
+    nodes: usize,
+    memory: usize,
+) -> nom::IResult<&[u8], StructureTag> {
+    parse_bounded(i, depth, &mut (nodes, memory))
+}
+fn parse_bounded<'a>(
+    i: &'a [u8],
+    depth: usize,
+    budget: &mut (usize, usize),
+) -> nom::IResult<&'a [u8], StructureTag> {
+    let failed = || nom::Err::Failure(Error::from_error_kind(i, ErrorKind::TooLarge));
+    if depth == 0 {
+        return Err(failed());
+    }
+    budget.0 = budget.0.checked_sub(1).ok_or_else(failed)?;
+    budget.1 = budget
+        .1
+        .checked_sub(2 * std::mem::size_of::<StructureTag>())
+        .ok_or_else(failed)?;
     let (mut i, ((class, structure, id), len)) = tuple((parse_type_header, parse_length))(i)?;
+    // This LDAP BER implementation supports low-tag-number forms only.
+    if id == 31 {
+        return Err(failed());
+    }
 
     let pl: PL = match structure {
         TagStructure::Primitive => {
             let (j, content) = take(len)(i)?;
             i = j;
 
+            budget.1 = budget.1.checked_sub(content.len()).ok_or_else(failed)?;
             PL::P(content.to_vec())
         }
         TagStructure::Constructed => {
@@ -67,7 +111,7 @@ pub fn parse_tag(i: &[u8]) -> nom::IResult<&[u8], StructureTag> {
 
             let mut tv: Vec<StructureTag> = Vec::new();
             while content.input_len() > 0 {
-                let (j, sub) = parse_tag(content)?;
+                let (j, sub) = parse_bounded(content, depth - 1, budget)?;
                 content = j;
                 tv.push(sub);
             }
@@ -213,5 +257,47 @@ mod test {
 
         let tag = parse_tag(&bytes[..]);
         assert_eq!(tag, Ok((&rest_tag[..], result_tag)));
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn malformed_lengths_integers_and_depth_are_rejected() {
+        for wire in [
+            &[0x30, 0x80][..],
+            &[0x30, 0x89],
+            &[0x1f, 0],
+            &[0x30, 2, 0x30, 0],
+        ] {
+            assert!(parse_tag_limited(wire, 1, 4, 1024).is_err());
+        }
+        assert!(parse_uint(&[]).is_err());
+        assert!(parse_uint(&[1; 9]).is_err());
+        assert!(parse_tag_limited(&[0x30, 4, 4, 0, 4, 0], 4, 2, 4096).is_err());
+        assert!(
+            parse_tag_limited(
+                &[4, 3, 1, 2, 3],
+                4,
+                2,
+                2 * std::mem::size_of::<StructureTag>() + 2
+            )
+            .is_err()
+        );
+        assert!(
+            parse_tag_limited(
+                &[4, 3, 1, 2, 3],
+                4,
+                2,
+                2 * std::mem::size_of::<StructureTag>() + 3
+            )
+            .is_ok()
+        );
+    }
+    #[test]
+    fn parsed_children_cannot_escape_their_parent_length() {
+        assert!(parse_tag_limited(&[0x30, 2, 4, 2, 1, 2], 8, 8, 4096).is_err());
+        assert_eq!(parse_tag(&[0x30, 2, 4, 0, 1, 2]).unwrap().0, &[1, 2]);
     }
 }

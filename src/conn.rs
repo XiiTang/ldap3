@@ -24,7 +24,6 @@ use lber::structures::{Null, Tag};
 
 #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
 use futures_util::future::TryFutureExt;
-use futures_util::sink::SinkExt;
 #[cfg(feature = "tls-native")]
 use native_tls::TlsConnector;
 #[cfg(unix)]
@@ -52,11 +51,21 @@ compile_error!(r#"Only one of "tls-native" and "tls-rustls" may be enabled for T
 compile_error!(
     r#"No crypto provider selected for Rustls, use "tls-rustls-aws-lc-rs" or "tls-rustls-ring", or see the README for instructions"#
 );
-use tokio_util::codec::{Decoder, Framed};
+use tokio_util::codec::{Decoder, Encoder, Framed};
 use url::{self, Url};
+
+/// A transport already authorized and secured by the caller.
+pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
+impl std::fmt::Debug for dyn AsyncStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SuppliedTransport")
+    }
+}
 
 #[derive(Debug)]
 enum ConnType {
+    Supplied(Box<dyn AsyncStream>),
     Tcp(TcpStream),
     #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
     Tls(TlsStream<TcpStream>),
@@ -152,6 +161,7 @@ impl AsyncRead for ConnType {
         buf: &mut ReadBuf,
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
+            ConnType::Supplied(ts) => Pin::new(ts).poll_read(cx, buf),
             ConnType::Tcp(ts) => Pin::new(ts).poll_read(cx, buf),
             #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
             ConnType::Tls(tls) => Pin::new(tls).poll_read(cx, buf),
@@ -164,6 +174,7 @@ impl AsyncRead for ConnType {
 impl AsyncWrite for ConnType {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
+            ConnType::Supplied(ts) => Pin::new(ts).poll_write(cx, buf),
             ConnType::Tcp(ts) => Pin::new(ts).poll_write(cx, buf),
             #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
             ConnType::Tls(tls) => Pin::new(tls).poll_write(cx, buf),
@@ -174,6 +185,7 @@ impl AsyncWrite for ConnType {
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         match self.get_mut() {
+            ConnType::Supplied(ts) => Pin::new(ts).poll_flush(cx),
             ConnType::Tcp(ts) => Pin::new(ts).poll_flush(cx),
             #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
             ConnType::Tls(tls) => Pin::new(tls).poll_flush(cx),
@@ -184,6 +196,7 @@ impl AsyncWrite for ConnType {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
         match self.get_mut() {
+            ConnType::Supplied(ts) => Pin::new(ts).poll_shutdown(cx),
             ConnType::Tcp(ts) => Pin::new(ts).poll_shutdown(cx),
             #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
             ConnType::Tls(tls) => Pin::new(tls).poll_shutdown(cx),
@@ -361,6 +374,7 @@ enum LoopMode {
 /// is possible through the [`LdapConnSettings`](struct.LdapConnSettings.html) struct, which can be
 /// passed to [`with_settings()`](#method.with_settings).
 pub struct LdapConnAsync {
+    raw: Option<crate::raw::Driver>,
     msgmap: Arc<Mutex<(i32, HashSet<i32>)>>,
     resultmap: HashMap<i32, ResultSender>,
     searchmap: HashMap<i32, ItemSender>,
@@ -531,6 +545,13 @@ impl LdapConnAsync {
                     }
                 }
                 let parts = conn.stream.into_parts();
+                if !parts.read_buf.is_empty() || !parts.write_buf.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected plaintext at LDAP TLS boundary",
+                    )
+                    .into());
+                }
                 let tls_stream = if let ConnType::Tcp(stream) = parts.io {
                     LdapConnAsync::create_tls_stream(settings, _hostname, stream).await?
                 } else {
@@ -662,23 +683,45 @@ impl LdapConnAsync {
         }
     }
 
+    /// Use exactly the supplied stream. No DNS, sockets, proxy or TLS fallback is performed.
+    pub fn from_stream<T: AsyncStream + 'static>(
+        stream: T,
+        limits: crate::CodecLimits,
+    ) -> Result<(Self, Ldap)> {
+        let codec = LdapCodec::new(limits)?;
+        Ok(Self::conn_pair_with_codec(
+            ConnType::Supplied(Box::new(stream)),
+            codec,
+        ))
+    }
+    /// Supplied-transport raw operations use the existing connection driver,
+    /// with globally bounded request, outstanding and response capacity.
+    pub fn from_stream_bounded<T: AsyncStream + 'static>(
+        stream: T,
+        limits: crate::DriverLimits,
+    ) -> Result<(Self, crate::RawHandle, crate::RawResponses)> {
+        let limits = limits.validate()?;
+        let (mut conn, ldap) = Self::from_stream(stream, limits.codec)?;
+        let (raw, handle, responses) = crate::raw::Driver::new(ldap, limits);
+        conn.raw = Some(raw);
+        Ok((conn, handle, responses))
+    }
     fn conn_pair(ctype: ConnType) -> (Self, Ldap) {
+        Self::conn_pair_with_codec(
+            ctype,
+            LdapCodec::new(Default::default()).expect("valid default codec limits"),
+        )
+    }
+    fn conn_pair_with_codec(ctype: ConnType, codec: LdapCodec) -> (Self, Ldap) {
         #[cfg(feature = "gssapi")]
-        let client_ctx = Arc::new(Mutex::new(None));
-        let codec = LdapCodec {
-            #[cfg(feature = "gssapi")]
-            has_decoded_data: false,
-            #[cfg(feature = "gssapi")]
-            sasl_param: Arc::new(RwLock::new((false, 0))),
-            #[cfg(feature = "gssapi")]
-            client_ctx: client_ctx.clone(),
-        };
+        let client_ctx = codec.client_ctx.clone();
         #[cfg(feature = "gssapi")]
         let sasl_param = codec.sasl_param.clone();
         let (tx, rx) = mpsc::unbounded_channel();
         let (id_scrub_tx, id_scrub_rx) = mpsc::unbounded_channel();
         let (misc_tx, misc_rx) = mpsc::unbounded_channel();
         let conn = LdapConnAsync {
+            raw: None,
             msgmap: Arc::new(Mutex::new((0, HashSet::new()))),
             resultmap: HashMap::new(),
             searchmap: HashMap::new(),
@@ -743,6 +786,47 @@ impl LdapConnAsync {
         }
     }
 
+    /// Drive exactly one terminal raw response and finish its physical write.
+    /// Used for explicit authentication or STARTTLS before continuous driving.
+    /// No transport security transition is performed by this method.
+    pub async fn drive_one(self) -> Result<Self> {
+        if self.raw.is_none() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "raw driver required").into());
+        }
+        self.turn(LoopMode::SingleOp).await?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "LDAP driver ended during exchange",
+            )
+            .into()
+        })
+    }
+    /// Recover the exact supplied transport after a completed upgrade response.
+    /// Buffered plaintext, queued commands or outstanding requests are rejected.
+    pub fn into_stream(self) -> Result<Box<dyn AsyncStream>> {
+        if !self.rx.is_empty() || !self.msgmap.lock().expect("msgmap mutex").1.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LDAP operations remain during upgrade",
+            )
+            .into());
+        }
+        let parts = self.stream.into_parts();
+        if !parts.read_buf.is_empty() || !parts.write_buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffered LDAP plaintext during upgrade",
+            )
+            .into());
+        }
+        match parts.io {
+            ConnType::Supplied(stream) => Ok(stream),
+            _ => Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "supplied transport required").into(),
+            ),
+        }
+    }
+
     /// Repeatedly poll the connection until it exits.
     pub async fn drive(self) -> Result<()> {
         self.turn(LoopMode::Continuous).await.map(|_| ())
@@ -750,122 +834,163 @@ impl LdapConnAsync {
 
     #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
     pub(crate) async fn single_op(self, tx: oneshot::Sender<Result<Self>>) {
-        if tx.send(self.turn(LoopMode::SingleOp).await).is_err() {
+        if tx
+            .send(self.turn(LoopMode::SingleOp).await.and_then(|value| {
+                value.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "LDAP connection ended during upgrade",
+                    )
+                    .into()
+                })
+            }))
+            .is_err()
+        {
             warn!("single op send error");
         }
     }
 
-    async fn turn(mut self, mode: LoopMode) -> Result<Self> {
+    async fn turn(self, mode: LoopMode) -> Result<Option<Self>> {
+        #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
+        let certificate = self.get_peer_certificate()?;
+        let Self {
+            mut raw,
+            msgmap,
+            mut resultmap,
+            mut searchmap,
+            mut rx,
+            mut id_scrub_rx,
+            mut misc_rx,
+            stream,
+        } = self;
+        let parts = stream.into_parts();
+        let (read_half, write_half) = io::split(parts.io);
+        let mut reader = tokio_util::codec::FramedRead::new(read_half, parts.codec.clone());
+        *reader.read_buffer_mut() = parts.read_buf;
+        let mut initial_writer = tokio_util::codec::FramedWrite::new(write_half, parts.codec);
+        *initial_writer.write_buffer_mut() = parts.write_buf;
+        type Writer = tokio_util::codec::FramedWrite<io::WriteHalf<ConnType>, LdapCodec>;
+        type Completed = (
+            Writer,
+            RequestId,
+            LdapOp,
+            Option<ResultSender>,
+            io::Result<()>,
+        );
+        let mut writer = Some(initial_writer);
+        let mut writing: Option<Pin<Box<dyn std::future::Future<Output = Completed> + Send>>> =
+            None;
+        let mut operation_complete = false;
         loop {
-            tokio::select! {
-                req_id = self.id_scrub_rx.recv() => {
-                    if let Some(req_id) = req_id {
-                        self.resultmap.remove(&req_id);
-                        self.searchmap.remove(&req_id);
-                        let mut msgmap = self.msgmap.lock().expect("msgmap mutex (id_scrub)");
-                        msgmap.1.remove(&req_id);
-                    }
-                },
-                op_tuple = self.rx.recv() => {
-                    if let Some((id, op, tag, controls, tx)) = op_tuple {
-                        if let LdapOp::Search(ref search_tx) = op {
-                            self.searchmap.insert(id, search_tx.clone());
-                        }
-                        if let Err(e) = self.stream.send((id, tag, controls)).await {
-                            warn!("socket send error: {}", e);
-                            return Err(LdapError::from(e));
-                        } else {
-                            match op {
-                                LdapOp::Single => {
-                                    self.resultmap.insert(id, tx);
-                                    continue;
-                                },
-                                LdapOp::Search(_) => (),
-                                LdapOp::Abandon(msgid) => {
-                                    self.resultmap.remove(&msgid);
-                                    self.searchmap.remove(&msgid);
-                                    let mut msgmap = self.msgmap.lock().expect("msgmap mutex (abandon)");
-                                    msgmap.1.remove(&id);
-                                },
-                                LdapOp::Unbind => {
-                                    if let Err(e) = self.stream.get_mut().shutdown().await {
-                                        warn!("socket shutdown error: {}", e);
-                                    }
-                                    if let Err(e) = self.stream.close().await {
-                                        warn!("socket close error: {}", e);
-                                    }
-                                },
-                            }
-                            if let Err(e) = tx.send((Tag::Null(Null { ..Default::default() }), vec![])) {
-                                warn!("ldap null result send error: {:?}", e);
-                            }
-                        }
-                    } else {
-                        break;
-                    }
-                },
-                misc = self.misc_rx.recv() => {
-                    if let Some(sender) = misc {
-                        match sender {
-                            #[cfg(any(feature = "tls-native", feature = "tls-rustls"))]
-                            MiscSender::Cert(tx) => {
-                                match self.get_peer_certificate() {
-                                    Ok(v) => {
-                                        if let Err(e) = tx.send(v) {
-                                            warn!("Couldn't send peer certificate over channel: {:?}", e);
-                                        }
-                                    },
-                                    Err(e) => warn!("Couldn't get peer certificate: {}", e),
-                                }
-                            },
-                        }
-                    } else {
-                        break;
-                    }
-                },
-                resp = self.stream.next() => {
-                    let (id, (tag, controls)) = match resp {
-                        None => break,
-                        Some(Err(e)) => {
-                            warn!("socket receive error: {}", e);
-                            return Err(LdapError::from(e));
+            if let Some(raw) = &raw {
+                raw.observe_buffers(reader.read_buffer().capacity());
+            }
+            if operation_complete && writing.is_none() && matches!(mode, LoopMode::SingleOp) {
+                let read = reader.into_parts();
+                let write = writer.take().expect("idle writer").into_parts();
+                let mut parts =
+                    tokio_util::codec::FramedParts::new(read.io.unsplit(write.io), read.codec);
+                parts.read_buf = read.read_buf;
+                parts.write_buf = write.write_buf;
+                return Ok(Some(Self {
+                    raw,
+                    msgmap,
+                    resultmap,
+                    searchmap,
+                    rx,
+                    id_scrub_rx,
+                    misc_rx,
+                    stream: Framed::from_parts(parts),
+                }));
+            }
+            tokio::select! {biased;
+                completed=async {writing.as_mut().expect("enabled writer").await}, if writing.is_some()=>{
+                    writing=None;
+                    let (returned,id,mut op,reply,result)=completed;
+                    writer=Some(returned);
+                    result?;
+                    match &mut op {
+                        LdapOp::Raw(op)=>crate::raw::Driver::completed(op),
+                        LdapOp::Single=>{},
+                        LdapOp::Search(_)=>{},
+                        LdapOp::Abandon(target)=>{
+                            resultmap.remove(target);searchmap.remove(target);
+                            let mut ids=msgmap.lock().expect("msgmap mutex");
+                            ids.1.remove(target);ids.1.remove(&id);
                         },
-                        Some(Ok(resp)) => resp,
-                    };
-                    if let Some(tx) = self.searchmap.get(&id) {
-                        let protoop = if let Tag::StructureTag(protoop) = tag {
-                            protoop
-                        } else {
-                            panic!("unmatched tag structure: {:?}", tag);
-                        };
-                        let (item, mut remove) = match protoop.id {
-                            4 | 25 => (SearchItem::Entry(protoop), false),
-                            5 => (SearchItem::Done(Tag::StructureTag(protoop).into()), true),
-                            19 => (SearchItem::Referral(protoop), false),
-                            _ => panic!("unrecognized op id: {}", protoop.id),
-                        };
-                        if let Err(e) = tx.send((item, controls)) {
-                            warn!("ldap search item send error, op={}: {:?}", id, e);
-                            remove = true;
-                        }
-                        if remove {
-                            self.searchmap.remove(&id);
-                        }
-                    } else if let Some(tx) = self.resultmap.remove(&id) {
-                        if let Err(e) = tx.send((tag, controls)) {
-                            warn!("ldap result send error: {:?}", e);
-                        }
-                        let mut msgmap = self.msgmap.lock().expect("msgmap mutex (stream rx)");
-                        msgmap.1.remove(&id);
-                    } else {
-                        warn!("unmatched id: {}", id);
+                        LdapOp::Unbind=>{msgmap.lock().expect("msgmap mutex").1.remove(&id);},
+                    }
+                    if let Some(reply)=reply {let _=reply.send((Tag::Null(Null::default()),vec![]));}
+                    if matches!(op,LdapOp::Unbind) || matches!(op,LdapOp::Raw(crate::raw::RawOperation {kind:crate::raw::Kind::Unbind,..})) {return Ok(None);}
+                },
+                req_id=id_scrub_rx.recv()=>{
+                    if let Some(id)=req_id {
+                        resultmap.remove(&id);searchmap.remove(&id);
+                        msgmap.lock().expect("msgmap mutex").1.remove(&id);
                     }
                 },
-            };
-            if let LoopMode::SingleOp = mode {
-                break;
+                operation=rx.recv(), if writing.is_none() && !operation_complete=>{
+                    let Some((id,mut op,tag,controls,reply))=operation else {return Ok(None);};
+                    let mut reply=Some(reply);
+                    match &mut op {
+                        LdapOp::Raw(op)=>{
+                            if let Err(error)=raw.as_mut().expect("raw driver").register(id,op){crate::raw::Driver::rejected(op,error);continue;}
+                            crate::raw::Driver::started(op);
+                        },
+                        LdapOp::Single=>{resultmap.insert(id,reply.take().expect("result sender"));},
+                        LdapOp::Search(sender)=>{searchmap.insert(id,sender.clone());},
+                        _=>{},
+                    }
+                    let mut output=writer.take().expect("idle writer");
+                    writing=Some(Box::pin(async move {
+                        let result=async {
+                            let mut encoded=bytes::BytesMut::new();
+                            output.encoder_mut().encode((id,tag,controls),&mut encoded)?;
+                            let bytes=zeroize::Zeroizing::new(encoded.to_vec());
+                            zeroize::Zeroize::zeroize(&mut encoded[..]);
+                            drop(encoded);
+                            output.get_mut().write_all(&bytes).await?;
+                            output.get_mut().flush().await?;
+                            if matches!(op,LdapOp::Unbind) || matches!(op,LdapOp::Raw(crate::raw::RawOperation {kind:crate::raw::Kind::Unbind,..})) {output.get_mut().shutdown().await?;}
+                            Ok(())
+                        }.await;
+                        (output,id,op,reply,result)
+                    }));
+                },
+                misc=misc_rx.recv()=>{
+                    match misc {
+                        #[cfg(any(feature="tls-native",feature="tls-rustls"))]
+                        Some(MiscSender::Cert(reply))=>{let _=reply.send(certificate.clone());},
+                        None=>return Ok(None),
+                    }
+                },
+                response=reader.next(), if !operation_complete=>{
+                    let Some(response)=response else {return Ok(None);};
+                    let response=response?;
+                    if let Some(raw)=&mut raw {
+                        let complete=raw.response(response)?;
+                        operation_complete=complete && matches!(mode,LoopMode::SingleOp);
+                        continue;
+                    }
+                    let (id,tag,controls)=(response.id,Tag::StructureTag(response.operation),response.controls);
+                    if let Some(sender)=searchmap.get(&id) {
+                        let Tag::StructureTag(operation)=tag else {unreachable!()};
+                        let (item,complete)=match operation.id {
+                            4|25=>(SearchItem::Entry(operation),false),
+                            5=>(SearchItem::Done(Tag::StructureTag(operation).into()),true),
+                            19=>(SearchItem::Referral(operation),false),
+                            _=>return Err(io::Error::new(io::ErrorKind::InvalidData,"unexpected LDAP search response").into()),
+                        };
+                        if sender.send((item,controls)).is_err() || complete {
+                            searchmap.remove(&id);msgmap.lock().expect("msgmap mutex").1.remove(&id);
+                        }
+                    } else if let Some(sender)=resultmap.remove(&id) {
+                        let _=sender.send((tag,controls));
+                        msgmap.lock().expect("msgmap mutex").1.remove(&id);
+                    }
+                    operation_complete=matches!(mode,LoopMode::SingleOp);
+                }
             }
         }
-        Ok(self)
     }
 }

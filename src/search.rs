@@ -13,9 +13,7 @@ use crate::result::{LdapError, LdapResult, Result};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time;
 
-use lber::common::TagClass;
 use lber::structure::StructureTag;
-use lber::structures::{Boolean, Enumerated, Integer, OctetString, Sequence, Tag};
 
 /// Possible values for search scope.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -614,52 +612,19 @@ where
             None => SearchOptions::new(),
         };
         self.timeout = self.ldap.timeout;
-        let req = Tag::Sequence(Sequence {
-            id: 3,
-            class: TagClass::Application,
-            inner: vec![
-                Tag::OctetString(OctetString {
-                    inner: Vec::from(base.as_bytes()),
-                    ..Default::default()
-                }),
-                Tag::Enumerated(Enumerated {
-                    inner: scope as i64,
-                    ..Default::default()
-                }),
-                Tag::Enumerated(Enumerated {
-                    inner: opts.deref as i64,
-                    ..Default::default()
-                }),
-                Tag::Integer(Integer {
-                    inner: opts.sizelimit as i64,
-                    ..Default::default()
-                }),
-                Tag::Integer(Integer {
-                    inner: opts.timelimit as i64,
-                    ..Default::default()
-                }),
-                Tag::Boolean(Boolean {
-                    inner: opts.typesonly,
-                    ..Default::default()
-                }),
-                match parse_filter(filter) {
-                    Ok(filter) => filter,
-                    _ => return Err(LdapError::FilterParsing),
-                },
-                Tag::Sequence(Sequence {
-                    inner: attrs
-                        .as_ref()
-                        .iter()
-                        .map(|s| {
-                            Tag::OctetString(OctetString {
-                                inner: Vec::from(s.as_ref()),
-                                ..Default::default()
-                            })
-                        })
-                        .collect(),
-                    ..Default::default()
-                }),
-            ],
+        let req = crate::requests::search(crate::requests::Search {
+            base: base.as_bytes().to_vec(),
+            scope,
+            dereference: opts.deref,
+            size_limit: opts.sizelimit,
+            time_limit: opts.timelimit,
+            types_only: opts.typesonly,
+            filter: parse_filter(filter).map_err(|_| LdapError::FilterParsing)?,
+            attributes: attrs
+                .as_ref()
+                .iter()
+                .map(|v| v.as_ref().as_bytes().to_vec())
+                .collect(),
         });
         let (tx, rx) = mpsc::unbounded_channel();
         self.rx = Some(rx);
