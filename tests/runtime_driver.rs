@@ -194,3 +194,47 @@ async fn explicit_upgrade_recovers_only_an_idle_transport_without_buffered_plain
         assert_eq!(stream.is_err(), trailing);
     }
 }
+
+#[tokio::test]
+async fn sasl_handoff_preserves_coalesced_security_frames_without_ber_decoding() {
+    use ldap3::asn1::ASNTag;
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, mut events) =
+        LdapConnAsync::from_stream_bounded(stream, limits()).unwrap();
+    let mut dispatch = handle
+        .submit(
+            ldap3::requests::sasl_bind("GSSAPI", Some(vec![])).into_structure(),
+            vec![],
+        )
+        .unwrap();
+    let exchange = tokio::spawn(conn.drive_one());
+    request(&mut peer).await;
+    let mut bytes = vec![
+        0x30,
+        12,
+        2,
+        1,
+        dispatch.id as u8,
+        0x61,
+        7,
+        10,
+        1,
+        0,
+        4,
+        0,
+        4,
+        0,
+    ];
+    let protected = b"\x00\x00\x00\x06opaque";
+    bytes.extend_from_slice(protected);
+    peer.write_all(&bytes).await.unwrap();
+    let conn = exchange.await.unwrap().unwrap();
+    dispatch.written().await.unwrap();
+    assert!(events.recv().await.unwrap().complete);
+    let (mut stream, buffered) = conn.into_security_stream().unwrap();
+    assert_eq!(buffered, protected);
+    stream.write_all(b"wrapped-next-request").await.unwrap();
+    let mut output = [0; 20];
+    peer.read_exact(&mut output).await.unwrap();
+    assert_eq!(&output, b"wrapped-next-request");
+}

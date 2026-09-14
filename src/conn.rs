@@ -801,6 +801,32 @@ impl LdapConnAsync {
             .into()
         })
     }
+    /// Recover the supplied transport and bytes following a completed SASL
+    /// response. Those bytes belong to the negotiated security layer, not BER.
+    pub fn into_security_stream(self) -> Result<(Box<dyn AsyncStream>, Vec<u8>)> {
+        if !self.rx.is_empty() || !self.msgmap.lock().expect("msgmap mutex").1.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "LDAP operations remain during SASL handoff",
+            )
+            .into());
+        }
+        let parts = self.stream.into_parts();
+        if !parts.write_buf.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "LDAP writes remain during SASL handoff",
+            )
+            .into());
+        }
+        match parts.io {
+            ConnType::Supplied(stream) => Ok((stream, parts.read_buf.to_vec())),
+            _ => Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "supplied transport required").into(),
+            ),
+        }
+    }
+
     /// Recover the exact supplied transport after a completed upgrade response.
     /// Buffered plaintext, queued commands or outstanding requests are rejected.
     pub fn into_stream(self) -> Result<Box<dyn AsyncStream>> {
