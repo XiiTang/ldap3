@@ -199,7 +199,11 @@ struct Pending {
     abandoned: bool,
     _lease: Arc<Lease>,
 }
+pub(crate) type Delivery =
+    std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Option<RequestId>>> + Send>>;
+
 pub(crate) struct Driver {
+    maximum_response_bytes: usize,
     pending: HashMap<RequestId, Pending>,
     storage: Arc<AtomicUsize>,
     output: mpsc::Sender<RawEvent>,
@@ -214,6 +218,7 @@ impl Driver {
         let storage = Arc::new(AtomicUsize::new(0));
         (
             Self {
+                maximum_response_bytes: limits.maximum_response_bytes,
                 pending: HashMap::new(),
                 output,
                 responses: responses.clone(),
@@ -278,7 +283,10 @@ impl Driver {
             let _ = reply.send(Ok(()));
         }
     }
-    pub fn response(&mut self, response: RawResponse) -> io::Result<bool> {
+    pub fn response_delivered(&mut self, id: RequestId) {
+        self.pending.remove(&id);
+    }
+    pub fn response(&mut self, response: RawResponse) -> io::Result<(bool, usize, Delivery)> {
         let (complete, abandon_requested) = if response.id == 0 {
             if response.operation.id != 24 {
                 return Err(io::Error::new(
@@ -300,23 +308,31 @@ impl Driver {
             )
         };
         let size = response.allocation_bytes()?;
-        let memory = self
-            .responses
-            .clone()
-            .try_acquire_many_owned(u32::try_from(size).map_err(|_| full())?)
-            .map_err(|_| full())?;
-        if complete {
-            self.pending.remove(&response.id);
+        if size > self.maximum_response_bytes {
+            return Err(full());
         }
-        self.output
-            .try_send(RawEvent {
+        let bytes = u32::try_from(size).map_err(|_| full())?;
+        let responses = self.responses.clone();
+        let output = self.output.clone();
+        let id = response.id;
+        // One decoded response waits outside the queue. The connection driver
+        // stops reading further BER frames while this future waits, but keeps
+        // its independent writer (including Abandon and Unbind) running.
+        let delivery = Box::pin(async move {
+            let slot = output.reserve().await.map_err(|_| closed())?;
+            let memory = responses
+                .acquire_many_owned(bytes)
+                .await
+                .map_err(|_| closed())?;
+            slot.send(RawEvent {
                 response,
                 complete,
                 abandon_requested,
                 _memory: memory,
-            })
-            .map_err(|_| full())?;
-        Ok(complete)
+            });
+            Ok(complete.then_some(id))
+        });
+        Ok((complete, size, delivery))
     }
 }
 impl Drop for Driver {

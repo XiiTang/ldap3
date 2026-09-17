@@ -907,11 +907,13 @@ impl LdapConnAsync {
         let mut writing: Option<Pin<Box<dyn std::future::Future<Output = Completed> + Send>>> =
             None;
         let mut operation_complete = false;
+        let mut delivering: Option<crate::raw::Delivery> = None;
+        let mut pending_response_bytes = 0;
         loop {
             if let Some(raw) = &raw {
-                raw.observe_buffers(reader.read_buffer().capacity());
+                raw.observe_buffers(reader.read_buffer().capacity().saturating_add(pending_response_bytes));
             }
-            if operation_complete && writing.is_none() && matches!(mode, LoopMode::SingleOp) {
+            if operation_complete && writing.is_none() && delivering.is_none() && matches!(mode, LoopMode::SingleOp) {
                 let read = reader.into_parts();
                 let write = writer.take().expect("idle writer").into_parts();
                 let mut parts =
@@ -948,6 +950,11 @@ impl LdapConnAsync {
                     }
                     if let Some(reply)=reply {let _=reply.send((Tag::Null(Null::default()),vec![]));}
                     if matches!(op,LdapOp::Unbind) || matches!(op,LdapOp::Raw(crate::raw::RawOperation {kind:crate::raw::Kind::Unbind,..})) {return Ok(None);}
+                },
+                result=async {delivering.as_mut().expect("enabled delivery").await}, if delivering.is_some()=>{
+                    if let Some(id)=result? { raw.as_mut().expect("raw driver").response_delivered(id); }
+                    delivering=None;
+                    pending_response_bytes=0;
                 },
                 req_id=id_scrub_rx.recv()=>{
                     if let Some(id)=req_id {
@@ -990,11 +997,13 @@ impl LdapConnAsync {
                         None=>return Ok(None),
                     }
                 },
-                response=reader.next(), if !operation_complete=>{
+                response=reader.next(), if !operation_complete && delivering.is_none()=>{
                     let Some(response)=response else {return Ok(None);};
                     let response=response?;
                     if let Some(raw)=&mut raw {
-                        let complete=raw.response(response)?;
+                        let (complete, bytes, delivery)=raw.response(response)?;
+                        delivering=Some(delivery);
+                        pending_response_bytes=bytes;
                         operation_complete=complete && matches!(mode,LoopMode::SingleOp);
                         continue;
                     }

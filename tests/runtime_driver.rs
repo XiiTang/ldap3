@@ -100,10 +100,11 @@ async fn mismatched_operation_closes_driver_without_delivering_a_false_result() 
     assert!(events.recv().await.is_none());
 }
 #[tokio::test]
-async fn full_delivery_queue_fails_explicitly_and_does_not_stall_transport() {
+async fn full_delivery_queue_backpressures_reads_but_keeps_abandon_writes_live() {
     let (stream, mut peer) = tokio::io::duplex(1024);
     let mut limits = limits();
     limits.maximum_response_items = 1;
+    limits.maximum_outstanding = 3;
     let (conn, mut handle, mut events) =
         LdapConnAsync::from_stream_bounded(stream, limits).unwrap();
     let driver = tokio::spawn(conn.drive());
@@ -113,9 +114,25 @@ async fn full_delivery_queue_fails_explicitly_and_does_not_stall_transport() {
     request(&mut peer).await;
     reply(&mut peer, first.id as u8, 0x6b).await;
     reply(&mut peer, second.id as u8, 0x6b).await;
-    assert!(driver.await.unwrap().is_err());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!driver.is_finished());
+    let third = handle.submit(delete(), vec![]).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), request(&mut peer))
+        .await
+        .unwrap();
+    let mut cancel = handle.submit(abandon(third.id as u8), vec![]).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), request(&mut peer))
+        .await
+        .unwrap();
+    cancel.written().await.unwrap();
+    reply(&mut peer, third.id as u8, 0x6b).await;
     assert_eq!(events.recv().await.unwrap().response.id, first.id);
-    assert!(events.recv().await.is_none());
+    assert_eq!(events.recv().await.unwrap().response.id, second.id);
+    let event = events.recv().await.unwrap();
+    assert_eq!(event.response.id, third.id);
+    assert!(event.abandon_requested);
+    driver.abort();
+    let _ = driver.await;
 }
 #[tokio::test]
 async fn request_byte_limit_is_shared_and_precedes_queue_and_id_allocation() {
@@ -144,9 +161,16 @@ async fn delivered_but_retained_responses_keep_their_byte_permits() {
     let second = handle.submit(delete(), vec![]).unwrap();
     request(&mut peer).await;
     reply(&mut peer, second.id as u8, 0x6b).await;
-    assert!(driver.await.unwrap().is_err());
-    assert!(handle.outcome_unknown());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), events.recv())
+            .await
+            .is_err()
+    );
+    assert!(!driver.is_finished());
     drop(retained);
+    assert_eq!(events.recv().await.unwrap().response.id, second.id);
+    driver.abort();
+    let _ = driver.await;
 }
 #[tokio::test]
 async fn explicit_upgrade_recovers_only_an_idle_transport_without_buffered_plaintext() {
@@ -237,4 +261,30 @@ async fn sasl_handoff_preserves_coalesced_security_frames_without_ber_decoding()
     let mut output = [0; 20];
     peer.read_exact(&mut output).await.unwrap();
     assert_eq!(&output, b"wrapped-next-request");
+}
+
+#[tokio::test]
+async fn cancellation_drops_a_capacity_blocked_driver_and_its_transport() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let mut limits = limits();
+    limits.maximum_response_items = 1;
+    let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(stream, limits).unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let first = handle.submit(delete(), vec![]).unwrap();
+    let second = handle.submit(delete(), vec![]).unwrap();
+    request(&mut peer).await;
+    request(&mut peer).await;
+    reply(&mut peer, first.id as u8, 0x6b).await;
+    reply(&mut peer, second.id as u8, 0x6b).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    driver.abort();
+    assert!(driver.await.unwrap_err().is_cancelled());
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), peer.read(&mut byte))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
 }
