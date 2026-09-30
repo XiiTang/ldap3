@@ -911,9 +911,18 @@ impl LdapConnAsync {
         let mut pending_response_bytes = 0;
         loop {
             if let Some(raw) = &raw {
-                raw.observe_buffers(reader.read_buffer().capacity().saturating_add(pending_response_bytes));
+                raw.observe_buffers(
+                    reader
+                        .read_buffer()
+                        .capacity()
+                        .saturating_add(pending_response_bytes),
+                );
             }
-            if operation_complete && writing.is_none() && delivering.is_none() && matches!(mode, LoopMode::SingleOp) {
+            if operation_complete
+                && writing.is_none()
+                && delivering.is_none()
+                && matches!(mode, LoopMode::SingleOp)
+            {
                 let read = reader.into_parts();
                 let write = writer.take().expect("idle writer").into_parts();
                 let mut parts =

@@ -77,11 +77,29 @@ impl RawDispatch {
 }
 /// Response capacity remains charged until this event is dropped, even after
 /// receiving it from the queue. No response or operation is silently discarded.
+struct Unconfirmed {
+    dispatched: DispatchStatus,
+    _lease: Arc<Lease>,
+}
 pub struct RawEvent {
     pub response: RawResponse,
     pub complete: bool,
     pub abandon_requested: bool,
     _memory: OwnedSemaphorePermit,
+    completion: Option<(
+        RequestId,
+        Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
+        Arc<Lease>,
+    )>,
+}
+impl RawEvent {
+    /// Confirm a fully validated terminal result. Dropping an unconfirmed
+    /// terminal event retains uncertainty and the message identifier lease.
+    pub fn confirm(&mut self) {
+        if let Some((id, unconfirmed, _lease)) = self.completion.take() {
+            unconfirmed.lock().expect("LDAP completion map").remove(&id);
+        }
+    }
 }
 pub struct RawResponses(mpsc::Receiver<RawEvent>);
 impl RawResponses {
@@ -98,6 +116,7 @@ pub struct RawHandle {
     responses: Arc<Semaphore>,
     storage: Arc<AtomicUsize>,
     uncertain: Arc<AtomicBool>,
+    unconfirmed: Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
 }
 impl Clone for RawHandle {
     fn clone(&self) -> Self {
@@ -109,6 +128,7 @@ impl Clone for RawHandle {
             responses: self.responses.clone(),
             storage: self.storage.clone(),
             uncertain: self.uncertain.clone(),
+            unconfirmed: self.unconfirmed.clone(),
         }
     }
 }
@@ -209,11 +229,13 @@ pub(crate) struct Driver {
     output: mpsc::Sender<RawEvent>,
     responses: Arc<Semaphore>,
     uncertain: Arc<AtomicBool>,
+    unconfirmed: Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
 }
 impl Driver {
     pub fn new(ldap: Ldap, limits: DriverLimits) -> (Self, RawHandle, RawResponses) {
         let (output, receiver) = mpsc::channel(limits.maximum_response_items);
         let uncertain = Arc::new(AtomicBool::new(false));
+        let unconfirmed = Arc::new(Mutex::new(HashMap::new()));
         let responses = Arc::new(Semaphore::new(limits.maximum_response_bytes));
         let storage = Arc::new(AtomicUsize::new(0));
         (
@@ -224,6 +246,7 @@ impl Driver {
                 responses: responses.clone(),
                 storage: storage.clone(),
                 uncertain: uncertain.clone(),
+                unconfirmed: unconfirmed.clone(),
             },
             RawHandle {
                 ldap,
@@ -233,6 +256,7 @@ impl Driver {
                 responses,
                 storage,
                 uncertain,
+                unconfirmed,
             },
             RawResponses(receiver),
         )
@@ -258,6 +282,16 @@ impl Driver {
             }
             Kind::Unbind => {}
             kind => {
+                self.unconfirmed
+                    .lock()
+                    .expect("LDAP completion map")
+                    .insert(
+                        id,
+                        Unconfirmed {
+                            dispatched: DispatchStatus(op.dispatched.clone()),
+                            _lease: op.lease.clone(),
+                        },
+                    );
                 self.pending.insert(
                     id,
                     Pending {
@@ -315,6 +349,13 @@ impl Driver {
         let responses = self.responses.clone();
         let output = self.output.clone();
         let id = response.id;
+        let completion = if complete {
+            self.pending
+                .get(&id)
+                .map(|pending| (id, self.unconfirmed.clone(), pending._lease.clone()))
+        } else {
+            None
+        };
         // One decoded response waits outside the queue. The connection driver
         // stops reading further BER frames while this future waits, but keeps
         // its independent writer (including Abandon and Unbind) running.
@@ -329,6 +370,7 @@ impl Driver {
                 complete,
                 abandon_requested,
                 _memory: memory,
+                completion,
             });
             Ok(complete.then_some(id))
         });
@@ -350,6 +392,12 @@ impl RawHandle {
             .msgmap
             .lock()
             .map_or(0, |ids| ids.1.capacity().saturating_mul(16));
+        let unconfirmed = self
+            .unconfirmed
+            .lock()
+            .expect("LDAP completion map")
+            .capacity()
+            .saturating_mul(std::mem::size_of::<(RequestId, Unconfirmed)>() + 32);
         self.limits
             .maximum_request_bytes
             .saturating_sub(self.requests.available_permits())
@@ -360,10 +408,15 @@ impl RawHandle {
             )
             .saturating_add(self.storage.load(Ordering::Acquire))
             .saturating_add(ids)
+            .saturating_add(unconfirmed)
     }
     /// A driver ended while a dispatched operation lacked a terminal response.
     pub fn outcome_unknown(&self) -> bool {
-        self.uncertain.load(Ordering::Acquire)
+        self.unconfirmed
+            .lock()
+            .expect("LDAP completion map")
+            .values()
+            .any(|operation| operation.dispatched.was_dispatched())
     }
     /// Queue one operation without waiting for a response. All in-flight and
     /// queued operations share limits, including calls made through clones.
