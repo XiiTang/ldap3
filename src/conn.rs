@@ -947,7 +947,7 @@ impl LdapConnAsync {
                     writer=Some(returned);
                     result?;
                     match &mut op {
-                        LdapOp::Raw(op)=>crate::raw::Driver::completed(op),
+                        LdapOp::Raw(op)=>raw.as_mut().expect("raw driver").completed(op),
                         LdapOp::Single=>{},
                         LdapOp::Search(_)=>{},
                         LdapOp::Abandon(target)=>{

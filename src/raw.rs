@@ -150,6 +150,8 @@ pub(crate) enum Kind {
     Reply(u64),
     Search,
     Abandon(RequestId),
+    /// An Abandon after which the search it names is forgotten.
+    Forget(RequestId),
     Unbind,
 }
 impl Kind {
@@ -219,6 +221,13 @@ struct Pending {
     abandoned: bool,
     _lease: Arc<Lease>,
 }
+/// A response the caller no longer routes: one for a search it forgot, after
+/// that search's Abandon was written. RFC 4511 section 4.11 has the server
+/// send nothing more for an abandoned operation, but one already on its way
+/// still arrives; ldapts and the upstream driver discard it too.
+fn discarded() -> (bool, usize, Delivery) {
+    (false, 0, Box::pin(async { Ok(None) }))
+}
 pub(crate) type Delivery =
     std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Option<RequestId>>> + Send>>;
 
@@ -230,6 +239,8 @@ pub(crate) struct Driver {
     responses: Arc<Semaphore>,
     uncertain: Arc<AtomicBool>,
     unconfirmed: Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
+    /// The identifiers issued so far, the highest first.
+    ids: Arc<Mutex<(RequestId, HashSet<RequestId>)>>,
 }
 impl Driver {
     pub fn new(ldap: Ldap, limits: DriverLimits) -> (Self, RawHandle, RawResponses) {
@@ -247,6 +258,7 @@ impl Driver {
                 storage: storage.clone(),
                 uncertain: uncertain.clone(),
                 unconfirmed: unconfirmed.clone(),
+                ids: ldap.msgmap.clone(),
             },
             RawHandle {
                 ldap,
@@ -278,6 +290,18 @@ impl Driver {
                     .pending
                     .get_mut(&target)
                     .ok_or_else(|| input("LDAP abandon target is not outstanding"))?;
+                pending.abandoned = true;
+            }
+            Kind::Forget(target) => {
+                let pending = self
+                    .pending
+                    .get_mut(&target)
+                    .ok_or_else(|| input("LDAP abandon target is not outstanding"))?;
+                // Only a search reads nothing, so only its outcome is not
+                // lost by forgetting it.
+                if !matches!(pending.kind, Kind::Search) {
+                    return Err(input("only a search is forgotten"));
+                }
                 pending.abandoned = true;
             }
             Kind::Unbind => {}
@@ -312,7 +336,16 @@ impl Driver {
     pub fn started(op: &RawOperation) {
         op.dispatched.store(true, Ordering::Release);
     }
-    pub fn completed(op: &mut RawOperation) {
+    /// `op` was written. A forgotten search's Abandon frees the search's
+    /// identifier and outstanding slot: the server sends nothing more for it.
+    pub fn completed(&mut self, op: &mut RawOperation) {
+        if let Kind::Forget(target) = op.kind {
+            self.pending.remove(&target);
+            self.unconfirmed
+                .lock()
+                .expect("LDAP completion map")
+                .remove(&target);
+        }
         if let Some(reply) = op.written.take() {
             let _ = reply.send(Ok(()));
         }
@@ -330,12 +363,18 @@ impl Driver {
             }
             (false, false)
         } else {
-            let pending = self.pending.get(&response.id).ok_or_else(|| {
-                io::Error::new(
+            let Some(pending) = self.pending.get(&response.id) else {
+                // An identifier issued and no longer outstanding is a
+                // forgotten search's; one never issued is the server's error.
+                let issued = self.ids.lock().map_or(0, |ids| ids.0);
+                if response.id > 0 && response.id <= issued {
+                    return Ok(discarded());
+                }
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "LDAP response has no outstanding message ID",
-                )
-            })?;
+                ));
+            };
             (
                 pending.kind.response(response.operation.id)?,
                 pending.abandoned,
@@ -426,10 +465,28 @@ impl RawHandle {
         operation: StructureTag,
         controls: Vec<crate::controls::RawControl>,
     ) -> io::Result<RawDispatch> {
+        let kind = Kind::from_tag(&operation)?;
+        self.dispatch(kind, operation, controls)
+    }
+    /// Abandons the outstanding search `search` and forgets it once the
+    /// Abandon is written, as ldapts forgets an abandoned message: its
+    /// identifier and outstanding slot are free again, and a response for it
+    /// that still arrives is discarded. An Abandon through `submit` instead
+    /// keeps the operation, so a late reply still reaches its caller.
+    pub fn forget(&mut self, search: RequestId) -> io::Result<RawDispatch> {
+        let operation = crate::asn1::ASNTag::into_structure(crate::requests::abandon(search));
+        Kind::from_tag(&operation)?;
+        self.dispatch(Kind::Forget(search), operation, vec![])
+    }
+    fn dispatch(
+        &mut self,
+        kind: Kind,
+        operation: StructureTag,
+        controls: Vec<crate::controls::RawControl>,
+    ) -> io::Result<RawDispatch> {
         if self.ldap.tx.is_closed() {
             return Err(closed());
         }
-        let kind = Kind::from_tag(&operation)?;
         let size = crate::protocol::request_allocation(&operation, &controls, self.limits.codec)?;
         let memory = self
             .requests

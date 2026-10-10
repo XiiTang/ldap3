@@ -87,6 +87,57 @@ async fn abandon_keeps_late_response_identity_and_invalid_abandon_does_not_dispa
     driver.abort();
     let _ = driver.await;
 }
+fn search() -> StructureTag {
+    StructureTag {
+        class: TagClass::Application,
+        id: 3,
+        payload: PL::C(vec![]),
+    }
+}
+#[tokio::test]
+async fn forgetting_a_search_frees_its_slot_and_discards_what_still_arrives() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let limits = DriverLimits {
+        maximum_outstanding: 3,
+        ..limits()
+    };
+    let (conn, mut handle, mut events) =
+        LdapConnAsync::from_stream_bounded(stream, limits).unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    // Only a search is forgotten: an update's outcome would be lost.
+    let update = handle.submit(delete(), vec![]).unwrap();
+    request(&mut peer).await;
+    let mut refused = handle.forget(update.id).unwrap();
+    assert!(refused.written().await.is_err());
+    reply(&mut peer, update.id as u8, 0x6b).await;
+    let mut updated = events.recv().await.unwrap();
+    assert_eq!(updated.response.id, update.id);
+    updated.confirm();
+    let mut forgotten = handle.forget(search.id).unwrap();
+    request(&mut peer).await;
+    forgotten.written().await.unwrap();
+    // Every slot of three is free again.
+    let first = handle.submit(delete(), vec![]).unwrap();
+    let second = handle.submit(delete(), vec![]).unwrap();
+    let third = handle.submit(delete(), vec![]).unwrap();
+    request(&mut peer).await;
+    request(&mut peer).await;
+    request(&mut peer).await;
+    // What the server still sends for the search reaches no one.
+    reply(&mut peer, search.id as u8, 0x65).await;
+    reply(&mut peer, first.id as u8, 0x6b).await;
+    let event = events.recv().await.unwrap();
+    assert_eq!(event.response.id, first.id);
+    for operation in [&second, &third] {
+        reply(&mut peer, operation.id as u8, 0x6b).await;
+        assert_eq!(events.recv().await.unwrap().response.id, operation.id);
+    }
+    // An identifier never issued still ends the driver.
+    reply(&mut peer, 99, 0x6b).await;
+    assert!(driver.await.unwrap().is_err());
+}
 #[tokio::test]
 async fn mismatched_operation_closes_driver_without_delivering_a_false_result() {
     let (stream, mut peer) = tokio::io::duplex(1024);

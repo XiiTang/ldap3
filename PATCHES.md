@@ -30,6 +30,15 @@ Changes:
   inside a complete frame fails immediately. The same encoder writes directly to
   its destination instead of making a nested copy for every enclosing sequence;
   outgoing primitive buffers and driver write buffers are erased on release.
+- `RawHandle::forget` abandons an outstanding search and, once its Abandon is
+  written, frees the search's identifier and outstanding slot, as ldapts
+  forgets an abandoned message. RFC 4511 section 4.11 has the server send
+  nothing more for it, so an Abandon through `submit`, which keeps the
+  operation for a late reply, held its slot for the connection's life. A
+  response for an identifier issued and no longer outstanding is discarded; one
+  never issued still ends the driver. Only a search is forgotten, since an
+  update's outcome would be lost. Regression:
+  `forgetting_a_search_frees_its_slot_and_discards_what_still_arrives`.
 - Shared operation/filter constructors used by both the upstream high-level
   methods and Runtime's binary DTO conversion. No second operation encoder or
   response-routing implementation is maintained by Runtime.
