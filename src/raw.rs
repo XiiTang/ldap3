@@ -60,7 +60,8 @@ pub enum RawWrite {
 }
 
 /// A command accepted into the bounded library queue. A dropped receipt does
-/// not undo or cancel dispatch. `written()` establishes physical flush only.
+/// not undo or cancel dispatch. Only `RawWrite::Written` establishes a physical
+/// flush; `RawWrite::NoSend` reports admission without transmission.
 #[derive(Clone)]
 pub struct DispatchStatus(Arc<AtomicBool>);
 impl DispatchStatus {
