@@ -945,7 +945,12 @@ impl LdapConnAsync {
                     writing=None;
                     let (returned,id,mut op,reply,result)=completed;
                     writer=Some(returned);
-                    result?;
+                    if let Err(error) = result {
+                        if let LdapOp::Raw(op) = &mut op {
+                            crate::raw::Driver::rejected(op, io::Error::new(error.kind(), error.to_string()));
+                        }
+                        return Err(error.into());
+                    }
                     match &mut op {
                         LdapOp::Raw(op)=>raw.as_mut().expect("raw driver").completed(op),
                         LdapOp::Single=>{},
@@ -976,7 +981,11 @@ impl LdapConnAsync {
                     let mut reply=Some(reply);
                     match &mut op {
                         LdapOp::Raw(op)=>{
-                            if let Err(error)=raw.as_mut().expect("raw driver").register(id,op){crate::raw::Driver::rejected(op,error);continue;}
+                            match raw.as_mut().expect("raw driver").register(id,op) {
+                                Ok(true) => {},
+                                Ok(false) => continue,
+                                Err(error) => {crate::raw::Driver::rejected(op,error);continue;}
+                            }
                             crate::raw::Driver::started(op);
                         },
                         LdapOp::Single=>{resultmap.insert(id,reply.take().expect("result sender"));},

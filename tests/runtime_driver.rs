@@ -55,9 +55,10 @@ async fn shared_capacity_survives_dropped_receipts_and_reverse_order_responses()
     request(&mut peer).await;
     second.written().await.unwrap();
     reply(&mut peer, second.id as u8, 0x6b).await;
-    let event = events.recv().await.unwrap();
+    let mut event = events.recv().await.unwrap();
     assert!(event.complete);
     assert_eq!(event.response.id, second.id);
+    event.confirm();
     let third = handle.submit(delete(), vec![]).unwrap();
     assert!(third.id > second.id);
     reply(&mut peer, first_id as u8, 0x6b).await;
@@ -264,7 +265,10 @@ async fn explicit_upgrade_recovers_only_an_idle_transport_without_buffered_plain
         peer.write_all(&response).await.unwrap();
         let conn = exchange.await.unwrap().unwrap();
         dispatch.written().await.unwrap();
-        assert!(events.recv().await.unwrap().complete);
+        let mut event = events.recv().await.unwrap();
+        assert!(event.complete);
+        event.confirm();
+        drop(event);
         let stream = conn.into_stream();
         assert_eq!(stream.is_err(), trailing);
     }
@@ -305,7 +309,10 @@ async fn sasl_handoff_preserves_coalesced_security_frames_without_ber_decoding()
     peer.write_all(&bytes).await.unwrap();
     let conn = exchange.await.unwrap().unwrap();
     dispatch.written().await.unwrap();
-    assert!(events.recv().await.unwrap().complete);
+    let mut event = events.recv().await.unwrap();
+    assert!(event.complete);
+    event.confirm();
+    drop(event);
     let (mut stream, buffered) = conn.into_security_stream().unwrap();
     assert_eq!(buffered, protected);
     stream.write_all(b"wrapped-next-request").await.unwrap();
@@ -337,5 +344,212 @@ async fn cancellation_drops_a_capacity_blocked_driver_and_its_transport() {
             .unwrap()
             .unwrap(),
         0
+    );
+}
+
+#[tokio::test]
+async fn no_response_controls_work_with_every_outstanding_slot_occupied() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(
+        stream,
+        DriverLimits {
+            maximum_outstanding: 1,
+            ..limits()
+        },
+    )
+    .unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    assert!(handle.submit(delete(), vec![]).is_err());
+    let mut abandoned = handle.submit(abandon(search.id as u8), vec![]).unwrap();
+    abandoned.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x50);
+    let mut forgotten = handle.forget(search.id).unwrap();
+    assert_eq!(forgotten.written().await.unwrap(), ldap3::RawWrite::NoSend);
+    assert!(!forgotten.was_dispatched());
+    let mut next = handle.submit(delete(), vec![]).unwrap();
+    next.written().await.unwrap();
+    assert_eq!(
+        request(&mut peer).await[3],
+        0x4a,
+        "forget must not send Abandon twice"
+    );
+    let mut unbind = handle
+        .submit(
+            StructureTag {
+                class: TagClass::Application,
+                id: 2,
+                payload: PL::P(vec![]),
+            },
+            vec![],
+        )
+        .unwrap();
+    unbind.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x42);
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn forgetting_an_already_abandoned_search_only_releases_its_slot() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(stream, limits()).unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    let mut abandoned = handle.submit(abandon(search.id as u8), vec![]).unwrap();
+    abandoned.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x50);
+    let mut forgotten = handle.forget(search.id).unwrap();
+    assert_eq!(forgotten.written().await.unwrap(), ldap3::RawWrite::NoSend);
+    assert!(!forgotten.was_dispatched());
+    let mut next = handle.submit(delete(), vec![]).unwrap();
+    next.written().await.unwrap();
+    assert_eq!(
+        request(&mut peer).await[3],
+        0x4a,
+        "duplicate Abandon on the wire"
+    );
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn a_decoded_completion_suppresses_abandon_without_claiming_confirmation() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, mut events) =
+        LdapConnAsync::from_stream_bounded(stream, limits()).unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    reply(&mut peer, search.id as u8, 0x65).await;
+    let mut final_result = events.recv().await.unwrap();
+    assert!(handle.outcome_unknown());
+    let mut abandoned = handle.submit(abandon(search.id as u8), vec![]).unwrap();
+    assert_eq!(abandoned.written().await.unwrap(), ldap3::RawWrite::NoSend);
+    assert!(!abandoned.was_dispatched());
+    assert!(
+        handle.outcome_unknown(),
+        "wire decoding is not semantic confirmation"
+    );
+    final_result.confirm();
+    drop(final_result);
+    assert!(!handle.outcome_unknown());
+    let mut next = handle.submit(delete(), vec![]).unwrap();
+    next.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x4a);
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn controls_still_obey_the_shared_request_byte_budget() {
+    let (stream, _peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(
+        stream,
+        DriverLimits {
+            maximum_outstanding: 1,
+            maximum_request_bytes: 65536,
+            ..limits()
+        },
+    )
+    .unwrap();
+    let search = handle.submit(search(), vec![]).unwrap();
+    let mut held = Vec::new();
+    loop {
+        match handle.forget(search.id) {
+            Ok(dispatch) => held.push(dispatch),
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        assert!(held.len() < 1024, "control allocation must be bounded");
+    }
+    assert!(
+        !held.is_empty(),
+        "controls do not use ordinary outstanding slots"
+    );
+    drop(conn);
+    assert_eq!(
+        handle.forget(search.id).err().unwrap().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+}
+
+#[tokio::test]
+async fn a_failed_cleanup_write_keeps_its_cause_and_outstanding_search() {
+    use std::{
+        io,
+        pin::Pin,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{Context, Poll},
+    };
+    struct FailingWriter {
+        stream: tokio::io::DuplexStream,
+        fail: Arc<AtomicBool>,
+    }
+    impl tokio::io::AsyncRead for FailingWriter {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_read(cx, buf)
+        }
+    }
+    impl tokio::io::AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail.load(Ordering::Acquire) {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "cleanup write fixture",
+                )))
+            } else {
+                Pin::new(&mut self.stream).poll_write(cx, bytes)
+            }
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.stream).poll_shutdown(cx)
+        }
+    }
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let fail = Arc::new(AtomicBool::new(false));
+    let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(
+        FailingWriter {
+            stream,
+            fail: fail.clone(),
+        },
+        limits(),
+    )
+    .unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let mut search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    search.written().await.unwrap();
+    fail.store(true, Ordering::Release);
+    let mut forget = handle.forget(search.id).unwrap();
+    let error = forget.written().await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+    assert_eq!(error.to_string(), "cleanup write fixture");
+    assert!(forget.was_dispatched());
+    assert!(handle.outcome_unknown());
+    assert!(
+        driver
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup write fixture")
     );
 }

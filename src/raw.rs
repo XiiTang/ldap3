@@ -50,6 +50,15 @@ fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "LDAP driver closed")
 }
 
+/// Whether admission to the physical writer still required a packet.
+/// `NoSend` is not a write or a peer acknowledgement. A completion may still
+/// await the caller's semantic validation through `RawEvent::confirm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawWrite {
+    Written,
+    NoSend,
+}
+
 /// A command accepted into the bounded library queue. A dropped receipt does
 /// not undo or cancel dispatch. `written()` establishes physical flush only.
 #[derive(Clone)]
@@ -61,11 +70,11 @@ impl DispatchStatus {
 }
 pub struct RawDispatch {
     pub id: RequestId,
-    written: oneshot::Receiver<io::Result<()>>,
+    written: oneshot::Receiver<io::Result<RawWrite>>,
     dispatched: Arc<AtomicBool>,
 }
 impl RawDispatch {
-    pub async fn written(&mut self) -> io::Result<()> {
+    pub async fn written(&mut self) -> io::Result<RawWrite> {
         (&mut self.written).await.map_err(|_| closed())?
     }
     pub fn was_dispatched(&self) -> bool {
@@ -136,7 +145,7 @@ impl Clone for RawHandle {
 pub(crate) struct Lease {
     id: RequestId,
     ids: Arc<Mutex<(RequestId, HashSet<RequestId>)>>,
-    _slot: OwnedSemaphorePermit,
+    _slot: Option<OwnedSemaphorePermit>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -208,7 +217,7 @@ pub(crate) struct RawOperation {
     pub kind: Kind,
     lease: Arc<Lease>,
     _memory: OwnedSemaphorePermit,
-    written: Option<oneshot::Sender<io::Result<()>>>,
+    written: Option<oneshot::Sender<io::Result<RawWrite>>>,
     dispatched: Arc<AtomicBool>,
 }
 impl std::fmt::Debug for RawOperation {
@@ -219,6 +228,7 @@ impl std::fmt::Debug for RawOperation {
 struct Pending {
     kind: Kind,
     abandoned: bool,
+    complete: bool,
     _lease: Arc<Lease>,
 }
 /// A response the caller no longer routes: one for a search it forgot, after
@@ -283,26 +293,29 @@ impl Driver {
             Ordering::Release,
         );
     }
-    pub fn register(&mut self, id: RequestId, op: &RawOperation) -> io::Result<()> {
+    /// One admission point for every raw write, after earlier writes finished.
+    /// Replies already decoded and Abandons already flushed need no packet.
+    pub fn register(&mut self, id: RequestId, op: &mut RawOperation) -> io::Result<bool> {
         match op.kind {
-            Kind::Abandon(target) => {
-                let pending = self
-                    .pending
-                    .get_mut(&target)
-                    .ok_or_else(|| input("LDAP abandon target is not outstanding"))?;
-                pending.abandoned = true;
-            }
-            Kind::Forget(target) => {
-                let pending = self
-                    .pending
-                    .get_mut(&target)
-                    .ok_or_else(|| input("LDAP abandon target is not outstanding"))?;
-                // Only a search reads nothing, so only its outcome is not
-                // lost by forgetting it.
-                if !matches!(pending.kind, Kind::Search) {
-                    return Err(input("only a search is forgotten"));
+            Kind::Abandon(target) | Kind::Forget(target) => {
+                let forget = matches!(op.kind, Kind::Forget(_));
+                let pending = self.pending.get(&target);
+                if let Some(pending) = pending {
+                    if forget && !matches!(pending.kind, Kind::Search) {
+                        return Err(input("only a search is forgotten"));
+                    }
+                } else if target > self.ids.lock().expect("LDAP identifiers").0 {
+                    return Err(input("LDAP abandon target is not outstanding"));
                 }
-                pending.abandoned = true;
+                if pending.is_none_or(|pending| pending.abandoned || pending.complete) {
+                    if forget {
+                        self.forget(target);
+                    }
+                    if let Some(reply) = op.written.take() {
+                        let _ = reply.send(Ok(RawWrite::NoSend));
+                    }
+                    return Ok(false);
+                }
             }
             Kind::Unbind => {}
             kind => {
@@ -321,12 +334,13 @@ impl Driver {
                     Pending {
                         kind,
                         abandoned: false,
+                        complete: false,
                         _lease: op.lease.clone(),
                     },
                 );
             }
         }
-        Ok(())
+        Ok(true)
     }
     pub fn rejected(op: &mut RawOperation, error: io::Error) {
         if let Some(reply) = op.written.take() {
@@ -339,16 +353,25 @@ impl Driver {
     /// `op` was written. A forgotten search's Abandon frees the search's
     /// identifier and outstanding slot: the server sends nothing more for it.
     pub fn completed(&mut self, op: &mut RawOperation) {
-        if let Kind::Forget(target) = op.kind {
-            self.pending.remove(&target);
-            self.unconfirmed
-                .lock()
-                .expect("LDAP completion map")
-                .remove(&target);
+        match op.kind {
+            Kind::Forget(target) => self.forget(target),
+            Kind::Abandon(target) => {
+                if let Some(pending) = self.pending.get_mut(&target) {
+                    pending.abandoned = true;
+                }
+            }
+            _ => {}
         }
         if let Some(reply) = op.written.take() {
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(Ok(RawWrite::Written));
         }
+    }
+    fn forget(&mut self, target: RequestId) {
+        self.pending.remove(&target);
+        self.unconfirmed
+            .lock()
+            .expect("LDAP completion map")
+            .remove(&target);
     }
     pub fn response_delivered(&mut self, id: RequestId) {
         self.pending.remove(&id);
@@ -363,7 +386,7 @@ impl Driver {
             }
             (false, false)
         } else {
-            let Some(pending) = self.pending.get(&response.id) else {
+            let Some(pending) = self.pending.get_mut(&response.id) else {
                 // An identifier issued and no longer outstanding is a
                 // forgotten search's; one never issued is the server's error.
                 let issued = self.ids.lock().map_or(0, |ids| ids.0);
@@ -375,10 +398,9 @@ impl Driver {
                     "LDAP response has no outstanding message ID",
                 ));
             };
-            (
-                pending.kind.response(response.operation.id)?,
-                pending.abandoned,
-            )
+            let complete = pending.kind.response(response.operation.id)?;
+            pending.complete = complete;
+            (complete, pending.abandoned)
         };
         let size = response.allocation_bytes()?;
         if size > self.maximum_response_bytes {
@@ -493,11 +515,18 @@ impl RawHandle {
             .clone()
             .try_acquire_many_owned(u32::try_from(size).map_err(|_| full())?)
             .map_err(|_| full())?;
-        let slot = self
-            .outstanding
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| full())?;
+        // Controls expect no response and must work even at the ordinary
+        // outstanding limit. Their allocations still share the byte budget.
+        let slot = if matches!(kind, Kind::Reply(_) | Kind::Search) {
+            Some(
+                self.outstanding
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| full())?,
+            )
+        } else {
+            None
+        };
         let id = self.ldap.next_msgid()?;
         let lease = Arc::new(Lease {
             id,

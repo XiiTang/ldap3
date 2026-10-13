@@ -241,7 +241,9 @@ mod filter;
 mod ldap;
 mod raw;
 pub mod requests;
-pub use raw::{DispatchStatus, DriverLimits, RawDispatch, RawEvent, RawHandle, RawResponses};
+pub use raw::{
+    DispatchStatus, DriverLimits, RawDispatch, RawEvent, RawHandle, RawResponses, RawWrite,
+};
 mod protocol;
 pub use protocol::{CodecLimits, LdapCodec, RawResponse};
 pub mod result;

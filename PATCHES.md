@@ -49,3 +49,23 @@ Verification covers the upstream library tests, the existing lber tests,
 OpenLDAP plus frozen-authentication, cancellation and public interpreter routes.
 This patch does not establish complete LDAP authentication, OS TLS/mTLS or all
 native-platform acceptance; those remain in IMAPipe's acceptance matrix.
+
+## No-response control admission and search cleanup
+
+`Driver::register` is the sole write-admission point: a completed request or an
+already flushed Abandon suppresses another packet. `RawWrite` distinguishes a
+physical write from no send; decoding a final response still does not confirm its
+semantic result. Only the caller's `RawEvent::confirm` does that. Explicit Abandon
+retains late replies and the original outstanding slot. Forget removes the route
+and slot after the first successful Abandon, or immediately if it was already
+written. Abandon, Forget and Unbind use the shared request-byte budget but no
+ordinary response slot. Failed writes preserve their cause in the receipt.
+
+Regression evidence on macOS arm64: the full-capacity and explicit-Abandon/Forget
+wire-count cases fail on the preceding pin and pass here. `runtime_driver` also
+checks no-send receipts after decoded completion, retained uncertainty until
+confirmation, control-byte exhaustion, cleanup-write failure, late replies and
+sibling progress. Three older fixture callers now explicitly confirm their
+validated terminal result before expecting capacity or an idle transport, as the
+raw API already requires. Library, codec and driver tests pass with
+`--no-default-features`; the caller's adapter suite covers the 1024-slot contract.
