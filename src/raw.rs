@@ -146,7 +146,12 @@ impl Clone for RawHandle {
 pub(crate) struct Lease {
     id: RequestId,
     ids: Arc<Mutex<(RequestId, HashSet<RequestId>)>>,
-    _slot: Option<OwnedSemaphorePermit>,
+    slot: Mutex<Option<OwnedSemaphorePermit>>,
+}
+impl Lease {
+    fn release_slot(&self) {
+        self.slot.lock().expect("LDAP outstanding slot").take();
+    }
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -368,11 +373,20 @@ impl Driver {
         }
     }
     fn forget(&mut self, target: RequestId) {
-        self.pending.remove(&target);
-        self.unconfirmed
+        if let Some(pending) = self.pending.remove(&target) {
+            pending._lease.release_slot();
+        }
+        if let Some(unconfirmed) = self
+            .unconfirmed
             .lock()
             .expect("LDAP completion map")
-            .remove(&target);
+            .remove(&target)
+        {
+            // A decoded terminal event may still own the identifier lease.
+            // Forget ends local tracking now; retaining that event continues
+            // to charge response bytes, but cannot retain an ordinary slot.
+            unconfirmed._lease.release_slot();
+        }
     }
     pub fn response_delivered(&mut self, id: RequestId) {
         self.pending.remove(&id);
@@ -532,7 +546,7 @@ impl RawHandle {
         let lease = Arc::new(Lease {
             id,
             ids: self.ldap.msgmap.clone(),
-            _slot: slot,
+            slot: Mutex::new(slot),
         });
         let (written, receipt) = oneshot::channel();
         let dispatched = Arc::new(AtomicBool::new(false));

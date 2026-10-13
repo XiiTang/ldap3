@@ -58,7 +58,10 @@ physical write from no send; decoding a final response still does not confirm it
 semantic result. Only the caller's `RawEvent::confirm` does that. Explicit Abandon
 retains late replies and the original outstanding slot. Forget removes the route
 and slot after the first successful Abandon, or immediately if it was already
-written. Abandon, Forget and Unbind use the shared request-byte budget but no
+written or the final response was decoded. A retained terminal event still owns
+its response bytes and identifier lease, but cannot keep an explicitly forgotten
+search's outstanding slot. `Driver::forget` releases that slot independently of
+the event's lifetime. Abandon, Forget and Unbind use the shared request-byte budget but no
 ordinary response slot. Failed writes preserve their cause in the receipt.
 
 Regression evidence on macOS arm64: the full-capacity and explicit-Abandon/Forget
@@ -69,3 +72,6 @@ sibling progress. Three older fixture callers now explicitly confirm their
 validated terminal result before expecting capacity or an idle transport, as the
 raw API already requires. Library, codec and driver tests pass with
 `--no-default-features`; the caller's adapter suite covers the 1024-slot contract.
+`forgetting_a_decoded_search_releases_its_slot_while_the_event_is_retained`
+fails with capacity exhaustion on the preceding pin and passes here, without a
+second Abandon or a fabricated semantic confirmation.

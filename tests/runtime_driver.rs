@@ -443,6 +443,37 @@ async fn a_decoded_completion_suppresses_abandon_without_claiming_confirmation()
 }
 
 #[tokio::test]
+async fn forgetting_a_decoded_search_releases_its_slot_while_the_event_is_retained() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, mut events) = LdapConnAsync::from_stream_bounded(
+        stream,
+        DriverLimits {
+            maximum_outstanding: 1,
+            ..limits()
+        },
+    )
+    .unwrap();
+    let driver = tokio::spawn(conn.drive());
+    let search = handle.submit(search(), vec![]).unwrap();
+    request(&mut peer).await;
+    reply(&mut peer, search.id as u8, 0x65).await;
+    let final_result = events.recv().await.unwrap();
+    assert!(handle.submit(delete(), vec![]).is_err());
+    assert!(handle.outcome_unknown());
+    let mut forgotten = handle.forget(search.id).unwrap();
+    assert_eq!(forgotten.written().await.unwrap(), ldap3::RawWrite::NoSend);
+    assert!(!handle.outcome_unknown());
+    let mut next = handle.submit(delete(), vec![]).unwrap();
+    next.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x4a, "no redundant Abandon");
+    assert_eq!(final_result.response.id, search.id);
+    assert!(final_result.complete);
+    drop(final_result);
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
 async fn controls_still_obey_the_shared_request_byte_budget() {
     let (stream, _peer) = tokio::io::duplex(1024);
     let (conn, mut handle, _events) = LdapConnAsync::from_stream_bounded(
