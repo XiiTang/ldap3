@@ -1,7 +1,7 @@
 # Runtime-supplied transport and bounded LDAP driver
 
 Base: upstream `inejge/ldap3` tag `v0.12.1`, commit
-`1107b192bb12783d8727025a77aeec079612afad` (full upstream history retained). Branch: `codex/runtime-driver`.
+`1107b192bb12783d8727025a77aeec079612afad` (full upstream history retained). Branch: `boundless`.
 
 The bounded raw handle uses the existing `LdapConnAsync` driver, codec and
 identifier allocator. Runtime supplies an already authorized transport and owns
@@ -23,8 +23,12 @@ Changes:
   dispatch receipt does not cancel or release a queued operation. A retained
   delivered response continues to consume its byte permit. Overflow terminates
   explicitly rather than blocking or silently losing delivery.
-- Physical write receipts, dispatch-status observation, uncertain-outcome state
-  after driver termination and memory reservation observations.
+- Physical write receipts, per-dispatch status and memory reservation
+  observations. The unused aggregate `RawHandle::outcome_unknown` observation
+  and its otherwise unused completion-map status field were removed: only fork
+  tests used it. `was_dispatched`, write receipts, `RawEvent::confirm`, identifier
+  leases and permit accounting remain. Tests assert confirmation/admission via
+  outstanding capacity, no-send receipts and per-dispatch status instead.
 - The existing lber parser checks frame, depth, node and allocation limits before
   allocation and validates envelope/controls without panic. Incomplete inner BER
   inside a complete frame fails immediately. The same encoder writes directly to
@@ -66,8 +70,8 @@ ordinary response slot. Failed writes preserve their cause in the receipt.
 
 Regression evidence on macOS arm64: the full-capacity and explicit-Abandon/Forget
 wire-count cases fail on the preceding pin and pass here. `runtime_driver` also
-checks no-send receipts after decoded completion, retained uncertainty until
-confirmation, control-byte exhaustion, cleanup-write failure, late replies and
+checks no-send receipts after decoded completion, outstanding capacity retained
+until confirmation, control-byte exhaustion, cleanup-write failure, late replies and
 sibling progress. Three older fixture callers now explicitly confirm their
 validated terminal result before expecting capacity or an idle transport, as the
 raw API already requires. Library, codec and driver tests pass with
@@ -75,3 +79,7 @@ raw API already requires. Library, codec and driver tests pass with
 `forgetting_a_decoded_search_releases_its_slot_while_the_event_is_retained`
 fails with capacity exhaustion on the preceding pin and passes here, without a
 second Abandon or a fabricated semantic confirmation.
+
+After removing the aggregate observation, `cargo +1.97.0 test
+--no-default-features --lib raw::tests` (1 test) and `cargo +1.97.0 test
+--no-default-features --test runtime_driver` (16 tests) pass on macOS arm64.

@@ -88,7 +88,6 @@ impl RawDispatch {
 /// Response capacity remains charged until this event is dropped, even after
 /// receiving it from the queue. No response or operation is silently discarded.
 struct Unconfirmed {
-    dispatched: DispatchStatus,
     _lease: Arc<Lease>,
 }
 pub struct RawEvent {
@@ -331,7 +330,6 @@ impl Driver {
                     .insert(
                         id,
                         Unconfirmed {
-                            dispatched: DispatchStatus(op.dispatched.clone()),
                             _lease: op.lease.clone(),
                         },
                     );
@@ -485,14 +483,6 @@ impl RawHandle {
             .saturating_add(self.storage.load(Ordering::Acquire))
             .saturating_add(ids)
             .saturating_add(unconfirmed)
-    }
-    /// A driver ended while a dispatched operation lacked a terminal response.
-    pub fn outcome_unknown(&self) -> bool {
-        self.unconfirmed
-            .lock()
-            .expect("LDAP completion map")
-            .values()
-            .any(|operation| operation.dispatched.was_dispatched())
     }
     /// Queue one operation without waiting for a response. All in-flight and
     /// queued operations share limits, including calls made through clones.
