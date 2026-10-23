@@ -46,6 +46,13 @@ fn input(text: &'static str) -> io::Error {
 fn full() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "LDAP capacity exhausted")
 }
+/// The peer has not completed enough requests to admit another response owner.
+/// Shared by every clone of a bounded raw handle; no-response controls use no slot.
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("LDAP outstanding request capacity exhausted (maximum {maximum})")]
+pub struct OutstandingLimit {
+    pub maximum: usize,
+}
 fn closed() -> io::Error {
     io::Error::new(io::ErrorKind::BrokenPipe, "LDAP driver closed")
 }
@@ -523,12 +530,14 @@ impl RawHandle {
         // Controls expect no response and must work even at the ordinary
         // outstanding limit. Their allocations still share the byte budget.
         let slot = if matches!(kind, Kind::Reply(_) | Kind::Search) {
-            Some(
-                self.outstanding
-                    .clone()
-                    .try_acquire_owned()
-                    .map_err(|_| full())?,
-            )
+            Some(self.outstanding.clone().try_acquire_owned().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    OutstandingLimit {
+                        maximum: self.limits.maximum_outstanding,
+                    },
+                )
+            })?)
         } else {
             None
         };

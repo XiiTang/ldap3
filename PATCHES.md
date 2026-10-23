@@ -11,6 +11,13 @@ There is no reconnect, referral traversal, replay or implicit Unbind in this pat
 
 Changes:
 
+- `RawHandle::dispatch` reports exhausted ordinary response slots with a typed
+  `OutstandingLimit` carrying `maximum_outstanding`, inside its `WouldBlock`
+  error. A peer withholding final responses can otherwise retain unbounded
+  correlation state. Request-byte exhaustion retains its separate byte-budget
+  path; no-response controls still need no ordinary slot. Regression:
+  `shared_capacity_survives_dropped_receipts_and_reverse_order_responses`
+  checks the shared-clone refusal and admission after a confirmed result.
 - Supplied asynchronous streams and explicit idle-stream recovery for STARTTLS.
   Buffered plaintext, queued requests and outstanding operations prevent recovery.
 - Independent physical reads and writes in the existing connection driver.

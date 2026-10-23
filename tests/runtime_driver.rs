@@ -49,7 +49,16 @@ async fn shared_capacity_survives_dropped_receipts_and_reverse_order_responses()
     let first_id = first.id;
     drop(first);
     let mut second = clone.submit(delete(), vec![]).unwrap();
-    assert!(handle.submit(delete(), vec![]).is_err());
+    let full = handle.submit(delete(), vec![]).err().unwrap();
+    assert_eq!(full.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        full.get_ref()
+            .unwrap()
+            .downcast_ref::<ldap3::OutstandingLimit>()
+            .unwrap()
+            .maximum,
+        2
+    );
     let driver = tokio::spawn(conn.drive());
     request(&mut peer).await;
     request(&mut peer).await;
