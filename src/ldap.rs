@@ -124,9 +124,11 @@ enum GssapiCred {
 impl Ldap {
     pub(crate) fn next_msgid(&mut self) -> std::io::Result<i32> {
         let mut ids = self.msgmap.lock().expect("msgmap mutex (inc id)");
-        let id = ids.0.checked_add(1).filter(|id| *id > 0).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "LDAP message ID space exhausted")
-        })?;
+        let id = ids
+            .0
+            .checked_add(1)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| std::io::Error::other("LDAP message ID space exhausted"))?;
         ids.0 = id;
         ids.1.insert(id);
         Ok(id)

@@ -46,7 +46,7 @@
 //!   server if possible. See [`Ldap::sasl_ntlm_bind()`](struct.Ldap.html#method.sasl_ntlm_bind).
 //!
 //! * __tls__ (enabled by default): TLS support, backed by the `native-tls` crate, which uses
-//!  a platform-specific TLS backend. This is an alias for __tls-native__.
+//!   a platform-specific TLS backend. This is an alias for __tls-native__.
 //!
 //! * __tls-rustls-...__ (disabled by default): TLS support, backed by the Rustls library. The
 //!   bare __tls-rustls__ flag, used previously for this purpose, won't work by itself; one

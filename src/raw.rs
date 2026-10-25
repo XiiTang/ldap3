@@ -97,16 +97,17 @@ impl RawDispatch {
 struct Unconfirmed {
     _lease: Arc<Lease>,
 }
+type Completion = (
+    RequestId,
+    Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
+    Arc<Lease>,
+);
 pub struct RawEvent {
     pub response: RawResponse,
     pub complete: bool,
     pub abandon_requested: bool,
     _memory: OwnedSemaphorePermit,
-    completion: Option<(
-        RequestId,
-        Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
-        Arc<Lease>,
-    )>,
+    completion: Option<Completion>,
 }
 impl RawEvent {
     /// Confirm a fully validated terminal result. Dropping an unconfirmed
@@ -561,7 +562,7 @@ impl RawHandle {
             .tx
             .send((
                 id,
-                LdapOp::Raw(raw),
+                LdapOp::Raw(Box::new(raw)),
                 Tag::StructureTag(operation),
                 Some(controls),
                 reply,
@@ -578,6 +579,43 @@ impl RawHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn dropping_a_queued_operation_keeps_its_receipt_error_and_releases_capacity() {
+        use crate::asn1::ASNTag;
+        let (stream, _peer) = tokio::io::duplex(128);
+        let limits = DriverLimits {
+            codec: CodecLimits::default(),
+            maximum_outstanding: 2,
+            maximum_request_bytes: 65536,
+            maximum_response_bytes: 65536,
+            maximum_response_items: 2,
+        };
+        let (conn, mut handle, _events) =
+            crate::LdapConnAsync::from_stream_bounded(stream, limits).unwrap();
+        let mut dispatch = handle
+            .submit(
+                crate::requests::delete(b"dc=x".to_vec()).into_structure(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(handle.outstanding.available_permits(), 1);
+        assert!(handle.requests.available_permits() < limits.maximum_request_bytes);
+        drop(conn);
+        let error = dispatch.written().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(error.to_string(), "LDAP driver closed");
+        assert!(!dispatch.was_dispatched());
+        assert_eq!(
+            handle.outstanding.available_permits(),
+            limits.maximum_outstanding
+        );
+        assert_eq!(
+            handle.requests.available_permits(),
+            limits.maximum_request_bytes
+        );
+        assert!(handle.ldap.msgmap.lock().unwrap().1.is_empty());
+    }
+
     #[tokio::test]
     async fn message_ids_never_alias_an_old_dispatch_after_exhaustion() {
         use crate::asn1::ASNTag;
@@ -602,13 +640,14 @@ mod tests {
                 .id,
             i32::MAX
         );
-        assert!(
-            handle
-                .submit(
-                    crate::requests::delete(b"dc=x".to_vec()).into_structure(),
-                    vec![]
-                )
-                .is_err()
-        );
+        let error = handle
+            .submit(
+                crate::requests::delete(b"dc=x".to_vec()).into_structure(),
+                vec![],
+            )
+            .err()
+            .expect("exhausted message identifiers");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "LDAP message ID space exhausted");
     }
 }

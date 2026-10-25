@@ -124,7 +124,7 @@ impl ExopParser for EndTxnResp {
 
         let mut msg_id = None;
         let mut upds_ctrls = None;
-        while let Some(tag) = tags.next() {
+        for tag in tags.by_ref() {
             match tag {
                 StructureTag {
                     id,
@@ -171,5 +171,23 @@ impl ExopParser for EndTxnResp {
         }
 
         EndTxnResp { msg_id, upds_ctrls }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn end_transaction_response_keeps_the_message_id_and_controls() {
+        let result = EndTxnResp::parse(&[0x30, 5, 2, 1, 7, 0x30, 0]);
+        assert_eq!(result.msg_id, Some(7));
+        assert!(result.upds_ctrls.unwrap().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "failed to parse endtxnresp")]
+    fn end_transaction_response_rejects_elements_after_the_controls() {
+        EndTxnResp::parse(&[0x30, 8, 2, 1, 7, 0x30, 0, 2, 1, 8]);
     }
 }

@@ -90,3 +90,45 @@ second Abandon or a fabricated semantic confirmation.
 After removing the aggregate observation, `cargo +1.97.0 test
 --no-default-features --lib raw::tests` (1 test) and `cargo +1.97.0 test
 --no-default-features --test runtime_driver` (16 tests) pass on macOS arm64.
+
+## Rust 1.97 strict Clippy (Boundless #316)
+
+The pinned `97a3f20adf4670e2d4ee7ff8ca5da9913aaa1d14` and the issue's
+`cd34abf57bab8d1025f26cd6c25429dde95c356f` baseline both reproduce 20 errors
+with Rust 1.97.0. Upstream HEAD is still the base release, `1107b192`; its
+error conversion, unescaper and transaction iterator retain the same forms,
+so there is no newer upstream lint repair to adopt.
+
+- Fourteen `result_large_err` findings come from the 152-byte `OpSend`
+  payload. Box only the fork's internal `LdapOp::Raw` payload at its sole
+  construction point, `RawHandle::dispatch`. The public `LdapError` variants,
+  `From<SendError<...>>`, failed request payload and error source stay intact.
+  Raw Unbind still shuts down the writer and terminates after the write.
+- Name the raw event's existing completion tuple with a private alias for
+  `type_complexity`; its ownership and confirmation behavior stay the same.
+- Use `io::Error::other` at the two `io_other_error` sites. Preserve the kind,
+  display text and existing I/O cause rather than wrapping the original
+  `LdapError` as a new cause. No mutex or poison handling changes.
+- Replace the checked `Option` unwrap with `if let`, preserving borrowed
+  unescaped strings and the `DecodingUTF8` result for invalid escapes.
+- Iterate transaction tags with `for ... in tags.by_ref()`, keeping the
+  post-loop rejection of trailing elements after the controls.
+- Indent the TLS feature's documentation continuation under its list item.
+
+No lint suppression is added. Preservation tests cover the closed-driver
+send error and its retained request/source, queued-operation receipt and
+permit release, I/O error kind/cause/display, message-ID exhaustion's kind
+and text, unescape failures, and transaction responses with trailing elements.
+Existing runtime driver tests exercise physical Unbind and cancellation.
+
+All Cargo checks use the build-slot wrapper with `CARGO_INCREMENTAL=0`.
+The fork's ignored lockfile is copied unchanged from the pinned clone for
+both baseline worktrees. Verification on macOS arm64, Rust 1.97.0:
+
+| Command | Before | After |
+| --- | --- | --- |
+| `cargo clippy --no-default-features --lib --tests --locked -- -D warnings` | Exit 101, 20 errors on both pins | Exit 0 |
+
+`cargo test --workspace --no-default-features --lib --tests --locked` also
+exits 0, including the preservation tests and the complete runtime codec/driver
+and lber library suites. Formatting checks exit 0.

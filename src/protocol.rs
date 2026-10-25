@@ -73,7 +73,8 @@ pub enum MiscSender {
 #[derive(Debug)]
 pub enum LdapOp {
     #[allow(private_interfaces)]
-    Raw(crate::raw::RawOperation),
+    // Keep queued requests and their recoverable send errors small.
+    Raw(Box<crate::raw::RawOperation>),
     Single,
     Search(ItemSender),
     Abandon(RequestId),

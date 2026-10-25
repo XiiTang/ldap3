@@ -344,10 +344,10 @@ pub fn ldap_unescape<'a, S: Into<Cow<'a, str>>>(val: S) -> Result<Cow<'a, str>> 
             _ => (),
         }
     }
-    if output.is_some() {
+    if let Some(output) = output {
         if let Unescaper::Value(_) = esc {
             Ok(Cow::Owned(
-                String::from_utf8(output.unwrap()).map_err(|_| LdapError::DecodingUTF8)?,
+                String::from_utf8(output).map_err(|_| LdapError::DecodingUTF8)?,
             ))
         } else {
             Err(LdapError::DecodingUTF8)
@@ -359,7 +359,21 @@ pub fn ldap_unescape<'a, S: Into<Cow<'a, str>>>(val: S) -> Result<Cow<'a, str>> 
 
 #[cfg(test)]
 mod test {
-    use super::dn_escape;
+    use super::{dn_escape, ldap_unescape};
+    use crate::LdapError;
+    use std::borrow::Cow;
+
+    #[test]
+    fn unescaping_preserves_borrowing_utf8_and_invalid_escape_errors() {
+        assert!(matches!(
+            ldap_unescape("plain").unwrap(),
+            Cow::Borrowed("plain")
+        ));
+        assert_eq!(ldap_unescape(r"a\c3\a9").unwrap(), "aé");
+        for input in ["a\\", r"a\0", r"a\gg", r"a\ff"] {
+            assert!(matches!(ldap_unescape(input), Err(LdapError::DecodingUTF8)));
+        }
+    }
 
     #[test]
     fn dn_esc_leading_space() {

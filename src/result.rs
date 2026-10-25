@@ -186,7 +186,7 @@ impl From<LdapError> for io::Error {
     fn from(le: LdapError) -> io::Error {
         match le {
             LdapError::Io { source, .. } => source,
-            _ => io::Error::new(io::ErrorKind::Other, format!("{}", le)),
+            _ => io::Error::other(format!("{}", le)),
         }
     }
 }
@@ -501,5 +501,54 @@ impl ExopResult {
         } else {
             Err(LdapError::from(self.1))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_closed_driver_preserves_the_failed_operation_and_error_source() {
+        let (stream, _peer) = tokio::io::duplex(128);
+        let (conn, mut ldap) =
+            crate::LdapConnAsync::from_stream(stream, crate::CodecLimits::default()).unwrap();
+        drop(conn);
+        let error = ldap.delete("dc=test").await.unwrap_err();
+        assert_eq!(error.to_string(), "op send error: channel closed");
+        let LdapError::OpSend { source } = &error else {
+            panic!("expected the failed operation");
+        };
+        assert!(std::ptr::addr_eq(
+            error.source().unwrap(),
+            source as &(dyn Error + 'static)
+        ));
+        let (id, op, tag, controls, _) = &source.0;
+        assert_eq!(*id, 1);
+        assert!(matches!(op, LdapOp::Single));
+        assert!(controls.is_none());
+        use lber::structures::ASNTag;
+        assert_eq!(
+            tag.clone().into_structure().payload,
+            lber::structure::PL::P(b"dc=test".to_vec())
+        );
+    }
+
+    #[test]
+    fn io_error_conversion_preserves_kind_cause_and_display() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("transport failure")]
+        struct TransportFailure;
+        let error = io::Error::from(LdapError::from(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            TransportFailure,
+        )));
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset);
+        assert!(error.get_ref().unwrap().is::<TransportFailure>());
+        assert_eq!(error.to_string(), "transport failure");
+
+        let error = io::Error::from(LdapError::DecodingUTF8);
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "utf8 decoding error");
     }
 }
