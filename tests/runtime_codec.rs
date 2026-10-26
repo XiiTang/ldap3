@@ -114,3 +114,157 @@ async fn blocked_large_write_does_not_stop_an_earlier_response() {
         0
     );
 }
+
+fn assert_request_limit(
+    operation: ldap3::asn1::StructureTag,
+    limits: CodecLimits,
+    expected: ldap3::RequestLimit,
+) {
+    let error = LdapCodec::new(limits)
+        .unwrap()
+        .validate_request(&operation, &[])
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<ldap3::RequestLimit>(),
+        Some(&expected),
+    );
+}
+
+#[test]
+fn request_depth_refusal_stops_before_counting_the_tree() {
+    use ldap3::asn1::ASNTag;
+    let mut operation = ldap3::requests::unbind().into_structure();
+    operation.payload = ldap3::asn1::PL::C(vec![operation.clone()]);
+    assert_request_limit(
+        operation,
+        CodecLimits {
+            maximum_depth: 1,
+            maximum_nodes: 1,
+            ..Default::default()
+        },
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::Depth,
+            maximum: 1,
+            observed: None,
+        },
+    );
+}
+
+#[test]
+fn request_tag_refusal_names_the_encoder_tag_bound() {
+    use ldap3::asn1::ASNTag;
+    let mut operation = ldap3::requests::unbind().into_structure();
+    operation.id = 31;
+    assert_request_limit(
+        operation,
+        CodecLimits::default(),
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::Tag,
+            maximum: 30,
+            observed: Some(31),
+        },
+    );
+}
+
+#[test]
+fn request_node_refusal_has_no_complete_observed_count() {
+    use ldap3::asn1::ASNTag;
+    let mut operation = ldap3::requests::unbind().into_structure();
+    operation.payload = ldap3::asn1::PL::C(vec![operation.clone(), operation.clone()]);
+    assert_request_limit(
+        operation,
+        CodecLimits {
+            maximum_nodes: 1,
+            ..Default::default()
+        },
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::Nodes,
+            maximum: 1,
+            observed: None,
+        },
+    );
+}
+
+#[test]
+fn request_retained_allocation_refusal_measures_capacity_before_frame() {
+    use ldap3::asn1::ASNTag;
+    let mut operation = ldap3::requests::unbind().into_structure();
+    let mut bytes = Vec::with_capacity(4096);
+    bytes.push(0);
+    let retained = bytes.capacity();
+    operation.payload = ldap3::asn1::PL::P(bytes);
+    assert_request_limit(
+        operation,
+        CodecLimits {
+            maximum_allocation: retained - 1,
+            maximum_frame: 2,
+            ..Default::default()
+        },
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::RetainedAllocation,
+            maximum: retained - 1,
+            observed: Some(retained),
+        },
+    );
+}
+
+#[test]
+fn request_frame_refusal_precedes_total_allocation_and_keeps_its_measurement() {
+    use ldap3::asn1::ASNTag;
+    assert_request_limit(
+        ldap3::requests::unbind().into_structure(),
+        CodecLimits {
+            maximum_frame: 2,
+            maximum_allocation: 100,
+            ..Default::default()
+        },
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::Frame,
+            maximum: 2,
+            observed: Some(10),
+        },
+    );
+    let at_frame = LdapCodec::new(CodecLimits {
+        maximum_frame: 10,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        at_frame
+            .validate_request(&ldap3::requests::unbind().into_structure(), &[])
+            .unwrap(),
+        1064
+    );
+}
+
+#[test]
+fn request_total_allocation_refusal_includes_encoder_and_bookkeeping() {
+    use ldap3::asn1::ASNTag;
+    assert_request_limit(
+        ldap3::requests::unbind().into_structure(),
+        CodecLimits {
+            maximum_allocation: 1063,
+            ..Default::default()
+        },
+        ldap3::RequestLimit {
+            kind: ldap3::RequestLimitKind::TotalAllocation,
+            maximum: 1063,
+            observed: Some(1064),
+        },
+    );
+    let at_allocation = LdapCodec::new(CodecLimits {
+        maximum_allocation: 1064,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        at_allocation
+            .validate_request(&ldap3::requests::unbind().into_structure(), &[])
+            .unwrap(),
+        1064
+    );
+}

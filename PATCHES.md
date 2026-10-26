@@ -132,3 +132,51 @@ both baseline worktrees. Verification on macOS arm64, Rust 1.97.0:
 `cargo test --workspace --no-default-features --lib --tests --locked` also
 exits 0, including the preservation tests and the complete runtime codec/driver
 and lber library suites. Formatting checks exit 0.
+
+## Typed request validation (Boundless #374)
+
+`protocol::request_allocation` is the shared admission check for
+`LdapCodec::validate_request` and `RawHandle::dispatch`, before identifier or
+permit acquisition. Its private `footprint` walk detects depth, unsupported tag,
+node and retained-allocation limits; `request_allocation` detects frame and total
+allocation limits. `RawResponse::allocation_bytes` shares the footprint count but
+maps its refusals to the original allocation error and cause, so response
+accounting preserves its error contract. Request admission returns `RequestLimit`
+as the source of an ordinary `InvalidInput` I/O error, following `OutstandingLimit` and Tokio's codec error
+source pattern. Checked arithmetic reports the corresponding limit with no
+complete measurement on overflow. The check order and traversal stop points
+are unchanged; validation never retries with relaxed limits or traverses again
+to obtain a complete count.
+
+Runtime maps this source once instead of reconstructing the codec's decision.
+Stopped node/depth traversal has no complete `observed` count. When frame and
+total allocation both exceed their limits, frame is reported because it is
+checked first. These follow the owner's 2026-10-27 decision: both refusals ask
+the caller to shrink the request, without changing the failure contract.
+
+`runtime_codec` regressions `request_depth_refusal_stops_before_counting_the_tree`,
+`request_tag_refusal_names_the_encoder_tag_bound`,
+`request_node_refusal_has_no_complete_observed_count`,
+`request_retained_allocation_refusal_measures_capacity_before_frame`,
+`request_frame_refusal_precedes_total_allocation_and_keeps_its_measurement` and
+`request_total_allocation_refusal_includes_encoder_and_bookkeeping` cover each
+kind, its measurements, precedence and accepted frame/allocation thresholds.
+
+Initial validation on macOS arm64, Rust 1.97.0, with `CARGO_INCREMENTAL=0` and
+the machine's build-slot wrapper: `cargo test --no-default-features --test
+runtime_codec --test runtime_driver --locked` exits 0 (10 codec and 16 driver
+tests); `cargo clippy --no-default-features --lib --tests --locked -- -D
+warnings` exits 0. The caller's LDAP module tests retain the pre-dispatch refusal
+and unaffected outstanding-search coverage.
+
+Review follow-up: `protocol::tests::response_footprint_refusals_keep_the_allocation_error_and_cause`
+checks the response's ordinary `InvalidInput` allocation error and its cause for
+unsupported tags and excessive depth. Request regressions continue to assert the
+typed codec refusals; only the response accounting boundary restores its previous
+error after the shared count stops.
+
+Review validation on macOS arm64, Rust 1.97.0, through the build-slot wrapper:
+`cargo test --no-default-features --lib --locked -- protocol::tests::` (1 test),
+`cargo test --no-default-features --test runtime_codec --locked` (10 tests),
+`cargo clippy --no-default-features --lib --tests --locked -- -D warnings` and
+`cargo fmt --all --check` all exit 0.

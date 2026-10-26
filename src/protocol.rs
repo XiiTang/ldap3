@@ -40,6 +40,56 @@ impl Default for CodecLimits {
         }
     }
 }
+/// The codec check that first refused an outgoing request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestLimitKind {
+    Depth,
+    Tag,
+    Nodes,
+    RetainedAllocation,
+    Frame,
+    TotalAllocation,
+}
+
+/// A request validation refusal, carried as an `InvalidInput` I/O error source.
+/// `observed` is absent when traversal stopped at its budget or arithmetic
+/// overflow prevented a complete measurement. Validation never resumes to count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("LDAP request {kind:?} limit exceeded (maximum {maximum}, observed {observed:?})")]
+pub struct RequestLimit {
+    pub kind: RequestLimitKind,
+    pub maximum: usize,
+    pub observed: Option<usize>,
+}
+impl RequestLimit {
+    fn error(self, observed: Option<usize>) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidInput, Self { observed, ..self })
+    }
+    fn add(self, a: usize, b: usize) -> io::Result<usize> {
+        a.checked_add(b).ok_or_else(|| self.error(None))
+    }
+    fn mul(self, a: usize, b: usize) -> io::Result<usize> {
+        a.checked_mul(b).ok_or_else(|| self.error(None))
+    }
+    fn tlv(self, payload: usize) -> io::Result<usize> {
+        self.add(
+            payload,
+            if payload < 128 {
+                2
+            } else {
+                2 + (usize::BITS - payload.leading_zeros()).div_ceil(8) as usize
+            },
+        )
+    }
+}
+fn request_limit(kind: RequestLimitKind, maximum: usize) -> RequestLimit {
+    RequestLimit {
+        kind,
+        maximum,
+        observed: None,
+    }
+}
+
 /// Exact envelope evidence and the parsed operation. No numeric result code is
 /// converted to a closed enum or interpreted as business success here.
 pub struct RawResponse {
@@ -335,46 +385,44 @@ fn too_large() -> io::Error {
 fn add(a: usize, b: usize) -> io::Result<usize> {
     a.checked_add(b).ok_or_else(too_large)
 }
-fn tlv(payload: usize) -> io::Result<usize> {
-    add(
-        payload,
-        if payload < 128 {
-            2
-        } else {
-            2 + (usize::BITS - payload.leading_zeros()).div_ceil(8) as usize
-        },
-    )
-}
 fn footprint(
     tag: &StructureTag,
     depth: usize,
     nodes: &mut usize,
     limits: CodecLimits,
 ) -> io::Result<(usize, usize)> {
-    if depth > limits.maximum_depth || tag.id >= 31 {
-        return Err(too_large());
+    if depth > limits.maximum_depth {
+        return Err(request_limit(RequestLimitKind::Depth, limits.maximum_depth).error(None));
     }
-    *nodes = nodes.checked_sub(1).ok_or_else(too_large)?;
+    if tag.id >= 31 {
+        return Err(request_limit(RequestLimitKind::Tag, 30).error(usize::try_from(tag.id).ok()));
+    }
+    *nodes = nodes
+        .checked_sub(1)
+        .ok_or_else(|| request_limit(RequestLimitKind::Nodes, limits.maximum_nodes).error(None))?;
+    let retained = request_limit(
+        RequestLimitKind::RetainedAllocation,
+        limits.maximum_allocation,
+    );
+    let frame = request_limit(RequestLimitKind::Frame, limits.maximum_frame);
     let (payload, memory) = match &tag.payload {
         PL::P(bytes) => (bytes.len(), bytes.capacity()),
         PL::C(children) => {
             let mut payload = 0;
-            let mut memory = children
-                .capacity()
-                .checked_mul(std::mem::size_of::<StructureTag>())
-                .ok_or_else(too_large)?;
+            let mut memory =
+                retained.mul(children.capacity(), std::mem::size_of::<StructureTag>())?;
             for child in children {
                 let (wire, heap) = footprint(child, depth + 1, nodes, limits)?;
-                payload = add(payload, wire)?;
-                memory = add(memory, heap)?;
+                payload = frame.add(payload, wire)?;
+                memory = retained.add(memory, heap)?;
             }
             (payload, memory)
         }
     };
     if memory > limits.maximum_allocation {
-        return Err(too_large());
+        return Err(retained.error(Some(memory)));
     }
-    Ok((tlv(payload)?, memory))
+    Ok((frame.tlv(payload)?, memory))
 }
 pub(crate) fn request_allocation(
     operation: &StructureTag,
@@ -383,39 +431,44 @@ pub(crate) fn request_allocation(
 ) -> io::Result<usize> {
     let mut nodes = limits.maximum_nodes;
     let (operation_wire, mut memory) = footprint(operation, 1, &mut nodes, limits)?;
+    let allocation = request_limit(RequestLimitKind::TotalAllocation, limits.maximum_allocation);
+    let frame = request_limit(RequestLimitKind::Frame, limits.maximum_frame);
     // Include the operation, envelope, request bookkeeping and temporary encoder nodes.
-    memory = add(memory, 1024)?;
+    memory = allocation.add(memory, 1024)?;
     let mut controls_wire = 0;
     for control in controls {
-        let wire = add(tlv(control.ctype.len())?, 3)?;
-        let wire = add(wire, control.val.as_ref().map_or(Ok(0), |v| tlv(v.len()))?)?;
-        controls_wire = add(controls_wire, tlv(wire)?)?;
-        memory = add(
+        let wire = frame.add(frame.tlv(control.ctype.len())?, 3)?;
+        let wire = frame.add(
+            wire,
+            control.val.as_ref().map_or(Ok(0), |v| frame.tlv(v.len()))?,
+        )?;
+        controls_wire = frame.add(controls_wire, frame.tlv(wire)?)?;
+        memory = allocation.add(
             memory,
-            add(
+            allocation.add(
                 512,
-                add(
+                allocation.add(
                     control.ctype.capacity(),
                     control.val.as_ref().map_or(0, Vec::capacity),
                 )?,
             )?,
         )?;
     }
-    let wire = tlv(add(
-        add(6, operation_wire)?,
+    let wire = frame.tlv(frame.add(
+        frame.add(6, operation_wire)?,
         if controls.is_empty() {
             0
         } else {
-            tlv(controls_wire)?
+            frame.tlv(controls_wire)?
         },
     )?)?;
     if wire > limits.maximum_frame {
-        return Err(too_large());
+        return Err(frame.error(Some(wire)));
     }
     // BytesMut may grow geometrically, and framing/tree conversion coexist.
-    memory = add(memory, wire.checked_mul(4).ok_or_else(too_large)?)?;
+    memory = allocation.add(memory, allocation.mul(wire, 4)?)?;
     if memory > limits.maximum_allocation {
-        return Err(too_large());
+        return Err(allocation.error(Some(memory)));
     }
     Ok(memory)
 }
@@ -431,7 +484,10 @@ impl RawResponse {
                 maximum_depth: 128,
                 ..Default::default()
             },
-        )?;
+        )
+        // Response accounting retains its original allocation error; typed
+        // request refusals belong to request admission only.
+        .map_err(|_| too_large())?;
         let mut size = add(add(heap, self.raw.len())?, std::mem::size_of::<Self>())?;
         size = add(
             size,
@@ -450,5 +506,38 @@ impl RawResponse {
             )?;
         }
         Ok(size)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_footprint_refusals_keep_the_allocation_error_and_cause() {
+        let mut unsupported = crate::requests::unbind().into_structure();
+        unsupported.id = 31;
+        let mut deep = crate::requests::unbind().into_structure();
+        for _ in 0..128 {
+            deep = StructureTag {
+                payload: PL::C(vec![deep]),
+                ..crate::requests::unbind().into_structure()
+            };
+        }
+        for operation in [unsupported, deep] {
+            let response = RawResponse {
+                id: 1,
+                operation,
+                controls: vec![],
+                raw: Bytes::new(),
+            };
+            let error = response.allocation_bytes().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(error.to_string(), "LDAP allocation or frame limit exceeded");
+            assert_eq!(
+                error.get_ref().unwrap().to_string(),
+                "LDAP allocation or frame limit exceeded",
+            );
+        }
     }
 }

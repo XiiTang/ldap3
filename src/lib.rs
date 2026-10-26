@@ -246,7 +246,7 @@ pub use raw::{
     RawWrite,
 };
 mod protocol;
-pub use protocol::{CodecLimits, LdapCodec, RawResponse};
+pub use protocol::{CodecLimits, LdapCodec, RawResponse, RequestLimit, RequestLimitKind};
 pub mod result;
 mod search;
 #[cfg(feature = "sync")]
