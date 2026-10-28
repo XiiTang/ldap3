@@ -268,3 +268,26 @@ fn request_total_allocation_refusal_includes_encoder_and_bookkeeping() {
         1064
     );
 }
+
+#[test]
+fn ad_notice_response_name_is_normalized_without_changing_received_bytes() {
+    let mut body = vec![2, 1, 0, 0x78, 7, 10, 1, 52, 4, 0, 4, 0, 0x8a, 22];
+    body.extend_from_slice(b"1.3.6.1.4.1.1466.20036");
+    let mut wire = vec![0x30, body.len() as u8];
+    wire.extend(body);
+    let mut codec = LdapCodec::new(CodecLimits::default()).unwrap();
+    let mut input = BytesMut::from(wire.as_slice());
+    let response = codec.decode(&mut input).unwrap().unwrap();
+    assert_eq!(response.id, 0);
+    assert_eq!(response.raw.as_ref(), wire);
+    let fields = response.operation.expect_constructed().unwrap();
+    let name = fields.last().unwrap();
+    assert_eq!(name.class, ldap3::asn1::TagClass::Context);
+    assert_eq!(name.id, 10);
+    assert_eq!(
+        name.clone().expect_primitive().unwrap(),
+        b"1.3.6.1.4.1.1466.20036"
+    );
+    assert!(response.controls.is_empty());
+    assert!(input.is_empty());
+}

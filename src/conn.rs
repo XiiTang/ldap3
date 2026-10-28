@@ -963,7 +963,14 @@ impl LdapConnAsync {
                         LdapOp::Unbind=>{msgmap.lock().expect("msgmap mutex").1.remove(&id);},
                     }
                     if let Some(reply)=reply {let _=reply.send((Tag::Null(Null::default()),vec![]));}
-                    if matches!(op,LdapOp::Unbind) || matches!(&op,LdapOp::Raw(raw) if matches!(raw.kind,crate::raw::Kind::Unbind)) {return Ok(None);}
+                    if matches!(op,LdapOp::Unbind) || matches!(&op,LdapOp::Raw(raw) if matches!(raw.kind,crate::raw::Kind::Unbind)) {
+                        // As upstream, shutdown failure is teardown information,
+                        // not failure of the Unbind already flushed above.
+                        if let Err(error) = writer.as_mut().expect("returned writer").get_mut().shutdown().await {
+                            warn!("socket shutdown error: {}", error);
+                        }
+                        return Ok(None);
+                    }
                 },
                 result=async {delivering.as_mut().expect("enabled delivery").await}, if delivering.is_some()=>{
                     if let Some(id)=result? { raw.as_mut().expect("raw driver").response_delivered(id); }
@@ -974,6 +981,8 @@ impl LdapConnAsync {
                     if let Some(id)=req_id {
                         resultmap.remove(&id);searchmap.remove(&id);
                         msgmap.lock().expect("msgmap mutex").1.remove(&id);
+                    } else {
+                        return Ok(None);
                     }
                 },
                 operation=rx.recv(), if writing.is_none() && !operation_complete=>{
@@ -1002,7 +1011,6 @@ impl LdapConnAsync {
                             drop(encoded);
                             output.get_mut().write_all(&bytes).await?;
                             output.get_mut().flush().await?;
-                            if matches!(op,LdapOp::Unbind) || matches!(&op,LdapOp::Raw(raw) if matches!(raw.kind,crate::raw::Kind::Unbind)) {output.get_mut().shutdown().await?;}
                             Ok(())
                         }.await;
                         (output,id,op,reply,result)

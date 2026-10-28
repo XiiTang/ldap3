@@ -180,3 +180,34 @@ Review validation on macOS arm64, Rust 1.97.0, through the build-slot wrapper:
 `cargo test --no-default-features --test runtime_codec --locked` (10 tests),
 `cargo clippy --no-default-features --lib --tests --locked -- -D warnings` and
 `cargo fmt --all --check` all exit 0.
+
+
+## Restore upstream handle-drop, Unbind and AD Notice behavior (F2/F4/F12a)
+
+Upstream 1107b192 `src/conn.rs:759-802` lets closed handle channels end its
+unbiased loop and logs Unbind shutdown errors after the packet was flushed.
+The bounded split-I/O loop retains its necessary write/delivery priority, but
+now ends when the scrub channel closes instead of starving its other closed
+channels. Unbind publishes its ordinary raw/high-level write completion after
+flush, then performs upstream's best-effort shutdown with a logged error.
+No new teardown error changes an already written receipt.
+
+Upstream `src/protocol.rs:81-90` tolerates AD's misplaced responseName sibling
+by ignoring it. The bounded decoder ports that workaround only for message ID
+zero's known Notice-of-Disconnection OID, moving the existing parsed tag into
+the ExtendedResponse so the caller can recognize the peer end. This minimal
+difference preserves exact raw bytes and the fork's required strict controls
+and allocation limits; ordinary trailing fields still use try_parse_controls.
+Message-ID allocation/reuse is unchanged (F12b is design-only).
+
+Regressions: `dropping_the_last_handle_ends_the_driver_and_transport`,
+`an_unbind_flushed_before_shutdown_failure_is_written`, and
+`ad_notice_response_name_is_normalized_without_changing_received_bytes`.
+The existing malformed-controls tests continue to exercise strict decoding.
+
+Validation on macOS arm64, Rust 1.97.0: workspace default tests and
+`--lib --tests --no-default-features` pass; strict Clippy for library/test
+workspace targets passes with default and no-default features; fmt passes.
+The wider no-default example build cannot import the feature-gated LdapConn,
+and strict all-targets Clippy also reports unchanged needless-question-mark
+examples. Those existing example configurations were not repaired or suppressed.

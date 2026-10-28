@@ -600,3 +600,73 @@ async fn a_failed_cleanup_write_keeps_its_cause_and_outstanding_search() {
             .contains("cleanup write fixture")
     );
 }
+
+#[tokio::test]
+async fn dropping_the_last_handle_ends_the_driver_and_transport() {
+    let (stream, mut peer) = tokio::io::duplex(128);
+    let (connection, handle, _responses) =
+        LdapConnAsync::from_stream_bounded(stream, limits()).unwrap();
+    drop(handle);
+    tokio::time::timeout(std::time::Duration::from_secs(2), connection.drive())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        peer.read_u8().await.unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[tokio::test]
+async fn an_unbind_flushed_before_shutdown_failure_is_written() {
+    use std::{
+        io,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    struct ShutdownFailure(tokio::io::DuplexStream);
+    impl AsyncRead for ShutdownFailure {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, bytes)
+        }
+    }
+    impl AsyncWrite for ShutdownFailure {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("shutdown failed after flush")))
+        }
+    }
+    let (stream, mut peer) = tokio::io::duplex(128);
+    let (connection, mut handle, _responses) =
+        LdapConnAsync::from_stream_bounded(ShutdownFailure(stream), limits()).unwrap();
+    let mut unbind = handle
+        .submit(
+            StructureTag {
+                class: TagClass::Application,
+                id: 2,
+                payload: PL::P(vec![]),
+            },
+            vec![],
+        )
+        .unwrap();
+    let driver = tokio::spawn(connection.drive());
+    assert_eq!(unbind.written().await.unwrap(), ldap3::RawWrite::Written);
+    driver.await.unwrap().unwrap();
+    let mut wire = Vec::new();
+    peer.read_to_end(&mut wire).await.unwrap();
+    assert_eq!(wire, [0x30, 7, 2, 1, 1, 0x42, 0, 0xa0, 0]);
+}

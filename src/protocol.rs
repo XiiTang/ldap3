@@ -222,12 +222,34 @@ fn decode_inner(buf: &mut BytesMut, limits: CodecLimits) -> io::Result<Option<Ra
     if id > i32::MAX as u64 {
         return Err(invalid());
     }
-    let operation = tags.next().ok_or_else(invalid)?;
+    let mut operation = tags.next().ok_or_else(invalid)?;
     if operation.class != TagClass::Application {
         return Err(invalid());
     }
-    let controls = tags
-        .next()
+    let mut trailing = tags.next();
+    // Upstream accepts AD's responseName outside ExtendedResponse. Move the
+    // known Notice field into its semantic position; keep the wire bytes below.
+    if id == 0
+        && operation.id == 24
+        && trailing.as_ref().is_some_and(|field| {
+            field.class == TagClass::Context
+                && field.id == 10
+                && matches!(&field.payload, PL::P(name) if name == b"1.3.6.1.4.1.1466.20036")
+        })
+    {
+        let PL::C(fields) = &mut operation.payload else {
+            return Err(invalid());
+        };
+        if fields
+            .iter()
+            .any(|field| field.class == TagClass::Context && field.id == 10)
+        {
+            return Err(invalid());
+        }
+        fields.push(trailing.take().expect("checked AD responseName"));
+        trailing = tags.next();
+    }
+    let controls = trailing
         .map(try_parse_controls)
         .transpose()?
         .unwrap_or_default();
