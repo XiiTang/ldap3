@@ -198,7 +198,7 @@ zero's known Notice-of-Disconnection OID, moving the existing parsed tag into
 the ExtendedResponse so the caller can recognize the peer end. This minimal
 difference preserves exact raw bytes and the fork's required strict controls
 and allocation limits; ordinary trailing fields still use try_parse_controls.
-Message-ID allocation/reuse is unchanged (F12b is design-only).
+Message-ID allocation/reuse is unchanged; the retained difference is documented below.
 
 Regressions: `dropping_the_last_handle_ends_the_driver_and_transport`,
 `an_unbind_flushed_before_shutdown_failure_is_written`, and
@@ -211,3 +211,20 @@ workspace targets passes with default and no-default features; fmt passes.
 The wider no-default example build cannot import the feature-gated LdapConn,
 and strict all-targets Clippy also reports unchanged needless-question-mark
 examples. Those existing example configurations were not repaired or suppressed.
+
+## Monotonic message IDs (F12b)
+
+Unlike upstream `1107b192`'s wrap-and-scan `next_msgid`, the fork never
+reissues an ID on a connection. The raw driver's late-reply classification
+(`src/raw.rs:412-413`) relies on this, and Boundless uses the wire ID as the
+request's immutable identity and Abandon target. Safe reuse would require
+control-lifetime binding and a Boundless request-identity cutover. Mature
+clients such as ldapts and OpenLDAP libldap do not exclude in-use or
+still-answerable IDs when reusing them, so their counters cannot replace
+this rule.
+
+Instead of upstream's exhaustion assertion, the fork returns the typed
+`LDAP message ID space exhausted` error (`io::ErrorKind::Other`). After
+issuing 2,147,483,647 IDs, the connection refuses further requests; the
+program must reconnect. Existing regression:
+`message_ids_never_alias_an_old_dispatch_after_exhaustion`.
