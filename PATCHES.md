@@ -228,3 +228,33 @@ Instead of upstream's exhaustion assertion, the fork returns the typed
 issuing 2,147,483,647 IDs, the connection refuses further requests; the
 program must reconnect. Existing regression:
 `message_ids_never_alias_an_old_dispatch_after_exhaustion`.
+
+## W17b local search retirement
+
+Selective port of 80903414 onto 607a386e, excluding the conditional 4813bab
+write-completion sink. RawDispatch keeps its original borrowing oneshot
+receiver and the driver keeps its original write/response APIs. Current
+boxed raw operations and bounded response/codec corrections remain.
+
+forget_local retires pending/unconfirmed search tracking without request
+byte admission or any packet, returning its outstanding slot immediately.
+Tracking is shared with RawHandle; a queued writer cannot recreate a locally
+forgotten route. Existing decoded events retain their response bytes and
+identifier leases until their owners drop. Admitted forget still writes
+first; callers invoke local forget after that result or when admission fails.
+
+At upstream 1107b192 conn.rs::turn, Abandon writes before removing search
+tracking; the pinned raw API likewise retired on completed/NoSend only.
+Local retirement is needed when a caller refuses notification admission,
+which otherwise strands the native outstanding slot. It changes no retry,
+timeout or cancellation policy and does not retract accepted writes.
+
+Regression ports: raw::tests::local_forget_needs_no_request_bytes_or_driver_progress
+and runtime_driver::local_forget_* cover queued, active and retained-terminal
+searches, later request progress and no Abandon.
+
+W17b selective-port validation on macOS arm64, consumer Rust 1.97.0:
+`cargo test --no-default-features --features sync --test runtime_driver
+local_forget` passes all three new real driver cases (exit 0); strict
+`cargo clippy --no-default-features --features sync --lib --tests --
+-D warnings` also passes (exit 0). No write-receipt sink is included.

@@ -670,3 +670,128 @@ async fn an_unbind_flushed_before_shutdown_failure_is_written() {
     peer.read_to_end(&mut wire).await.unwrap();
     assert_eq!(wire, [0x30, 7, 2, 1, 1, 0x42, 0, 0xa0, 0]);
 }
+
+#[tokio::test]
+async fn local_forget_releases_a_search_without_sending_abandon() {
+    for completed in [false, true] {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let (conn, mut handle, mut events) = LdapConnAsync::from_stream_bounded(
+            stream,
+            DriverLimits {
+                maximum_outstanding: 1,
+                ..limits()
+            },
+        )
+        .unwrap();
+        let driver = tokio::spawn(conn.drive());
+        let mut search = handle.submit(search(), vec![]).unwrap();
+        search.written().await.unwrap();
+        request(&mut peer).await;
+        let retained = if completed {
+            reply(&mut peer, search.id as u8, 0x65).await;
+            Some(events.recv().await.unwrap())
+        } else {
+            None
+        };
+        assert!(handle.submit(delete(), vec![]).is_err());
+        let mut clone = handle.clone();
+        clone.forget_local(search.id).unwrap();
+        clone.forget_local(search.id).unwrap();
+        let mut next = handle.submit(delete(), vec![]).unwrap();
+        next.written().await.unwrap();
+        assert_eq!(
+            request(&mut peer).await[3],
+            0x4a,
+            "local forget sends no packet"
+        );
+        reply(&mut peer, search.id as u8, 0x65).await;
+        reply(&mut peer, next.id as u8, 0x6b).await;
+        let mut event = events.recv().await.unwrap();
+        assert_eq!(event.response.id, next.id);
+        event.confirm();
+        if let Some(event) = retained {
+            assert_eq!(event.response.id, search.id);
+            assert!(event.complete);
+        }
+        driver.abort();
+        let _ = driver.await;
+    }
+}
+
+#[tokio::test]
+async fn local_forget_does_not_recreate_tracking_when_a_queued_search_writes() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, mut events) = LdapConnAsync::from_stream_bounded(
+        stream,
+        DriverLimits {
+            maximum_outstanding: 1,
+            ..limits()
+        },
+    )
+    .unwrap();
+    let mut search = handle.submit(search(), vec![]).unwrap();
+    handle.forget_local(search.id).unwrap();
+    let mut next = handle.submit(delete(), vec![]).unwrap();
+    let driver = tokio::spawn(conn.drive());
+    // Local retirement does not undo an accepted write, or restore its route.
+    assert_eq!(search.written().await.unwrap(), ldap3::RawWrite::Written);
+    next.written().await.unwrap();
+    assert_eq!(request(&mut peer).await[3], 0x63);
+    assert_eq!(request(&mut peer).await[3], 0x4a);
+    reply(&mut peer, search.id as u8, 0x65).await;
+    reply(&mut peer, next.id as u8, 0x6b).await;
+    let mut event = events.recv().await.unwrap();
+    assert_eq!(event.response.id, next.id);
+    event.confirm();
+    let mut third = handle.submit(delete(), vec![]).unwrap();
+    third.written().await.unwrap();
+    request(&mut peer).await;
+    driver.abort();
+    let _ = driver.await;
+}
+
+#[tokio::test]
+async fn local_forget_rejects_unissued_ids_and_tracked_updates() {
+    for completed in [false, true] {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let (conn, mut handle, mut events) = LdapConnAsync::from_stream_bounded(
+            stream,
+            DriverLimits {
+                maximum_outstanding: 1,
+                ..limits()
+            },
+        )
+        .unwrap();
+        for id in [-1, 0, 1] {
+            assert_eq!(
+                handle.forget_local(id).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+        let mut update = handle.submit(delete(), vec![]).unwrap();
+        // Validate before driver registration, while queued too.
+        assert!(handle.forget_local(update.id).is_err());
+        let driver = tokio::spawn(conn.drive());
+        update.written().await.unwrap();
+        request(&mut peer).await;
+        let retained = if completed {
+            reply(&mut peer, update.id as u8, 0x6b).await;
+            Some(events.recv().await.unwrap())
+        } else {
+            None
+        };
+        assert!(handle.forget_local(update.id).is_err());
+        assert!(handle.submit(delete(), vec![]).is_err());
+        if let Some(mut event) = retained {
+            event.confirm();
+        } else {
+            reply(&mut peer, update.id as u8, 0x6b).await;
+            events.recv().await.unwrap().confirm();
+        }
+        let mut next = handle.submit(delete(), vec![]).unwrap();
+        next.written().await.unwrap();
+        request(&mut peer).await;
+        driver.abort();
+        let _ = driver.await;
+    }
+}
