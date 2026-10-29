@@ -235,3 +235,9 @@ timeout or cancellation policy and does not retract accepted writes.
 Regression ports: raw::tests::local_forget_needs_no_request_bytes_or_driver_progress
 and runtime_driver::local_forget_* cover queued, active and retained-terminal
 searches, later request progress and no Abandon. Execution pending.
+
+W17b selective-port validation on macOS arm64, consumer Rust 1.97.0:
+`cargo test --no-default-features --features sync --test runtime_driver
+local_forget` passes all three new real driver cases (exit 0); strict
+`cargo clippy --no-default-features --features sync --lib --tests --
+-D warnings` also passes (exit 0). No write-receipt sink is included.
