@@ -633,7 +633,11 @@ impl RawHandle {
             self.tracking.lock().expect("LDAP tracking").forget(id);
             return Err(closed());
         }
-        Ok(RawDispatch { id, written: receipt, dispatched })
+        Ok(RawDispatch {
+            id,
+            written: receipt,
+            dispatched,
+        })
     }
 }
 
@@ -686,7 +690,6 @@ mod tests {
             )
             .unwrap();
     }
-
 
     #[tokio::test]
     async fn dropping_a_queued_operation_keeps_its_receipt_error_and_releases_capacity() {
