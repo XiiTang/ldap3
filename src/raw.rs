@@ -95,13 +95,10 @@ impl RawDispatch {
 /// Response capacity remains charged until this event is dropped, even after
 /// receiving it from the queue. No response or operation is silently discarded.
 struct Unconfirmed {
+    kind: Kind,
     _lease: Arc<Lease>,
 }
-type Completion = (
-    RequestId,
-    Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
-    Arc<Lease>,
-);
+type Completion = (RequestId, Arc<Mutex<Tracking>>, Arc<Lease>);
 pub struct RawEvent {
     pub response: RawResponse,
     pub complete: bool,
@@ -113,8 +110,12 @@ impl RawEvent {
     /// Confirm a fully validated terminal result. Dropping an unconfirmed
     /// terminal event retains uncertainty and the message identifier lease.
     pub fn confirm(&mut self) {
-        if let Some((id, unconfirmed, _lease)) = self.completion.take() {
-            unconfirmed.lock().expect("LDAP completion map").remove(&id);
+        if let Some((id, tracking, _lease)) = self.completion.take() {
+            tracking
+                .lock()
+                .expect("LDAP tracking")
+                .unconfirmed
+                .remove(&id);
         }
     }
 }
@@ -133,7 +134,7 @@ pub struct RawHandle {
     responses: Arc<Semaphore>,
     storage: Arc<AtomicUsize>,
     uncertain: Arc<AtomicBool>,
-    unconfirmed: Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
+    tracking: Arc<Mutex<Tracking>>,
 }
 impl Clone for RawHandle {
     fn clone(&self) -> Self {
@@ -145,7 +146,7 @@ impl Clone for RawHandle {
             responses: self.responses.clone(),
             storage: self.storage.clone(),
             uncertain: self.uncertain.clone(),
-            unconfirmed: self.unconfirmed.clone(),
+            tracking: self.tracking.clone(),
         }
     }
 }
@@ -242,10 +243,28 @@ struct Pending {
     kind: Kind,
     abandoned: bool,
     complete: bool,
+    registered: bool,
     _lease: Arc<Lease>,
 }
-/// A response the caller no longer routes: one for a search it forgot, after
-/// that search's Abandon was written. RFC 4511 section 4.11 has the server
+#[derive(Default)]
+struct Tracking {
+    pending: HashMap<RequestId, Pending>,
+    unconfirmed: HashMap<RequestId, Unconfirmed>,
+}
+impl Tracking {
+    // Every local retirement releases both the route and its ordinary slot.
+    // A retained event or queued writer may still hold the identifier lease.
+    fn forget(&mut self, target: RequestId) {
+        if let Some(pending) = self.pending.remove(&target) {
+            pending._lease.release_slot();
+        }
+        if let Some(unconfirmed) = self.unconfirmed.remove(&target) {
+            unconfirmed._lease.release_slot();
+        }
+    }
+}
+/// A response the caller no longer routes: one for a search it forgot locally
+/// or after that search's Abandon was written. RFC 4511 section 4.11 has the server
 /// send nothing more for an abandoned operation, but one already on its way
 /// still arrives; ldapts and the upstream driver discard it too.
 fn discarded() -> (bool, usize, Delivery) {
@@ -256,12 +275,11 @@ pub(crate) type Delivery =
 
 pub(crate) struct Driver {
     maximum_response_bytes: usize,
-    pending: HashMap<RequestId, Pending>,
     storage: Arc<AtomicUsize>,
     output: mpsc::Sender<RawEvent>,
     responses: Arc<Semaphore>,
     uncertain: Arc<AtomicBool>,
-    unconfirmed: Arc<Mutex<HashMap<RequestId, Unconfirmed>>>,
+    tracking: Arc<Mutex<Tracking>>,
     /// The identifiers issued so far, the highest first.
     ids: Arc<Mutex<(RequestId, HashSet<RequestId>)>>,
 }
@@ -269,18 +287,17 @@ impl Driver {
     pub fn new(ldap: Ldap, limits: DriverLimits) -> (Self, RawHandle, RawResponses) {
         let (output, receiver) = mpsc::channel(limits.maximum_response_items);
         let uncertain = Arc::new(AtomicBool::new(false));
-        let unconfirmed = Arc::new(Mutex::new(HashMap::new()));
+        let tracking = Arc::new(Mutex::new(Tracking::default()));
         let responses = Arc::new(Semaphore::new(limits.maximum_response_bytes));
         let storage = Arc::new(AtomicUsize::new(0));
         (
             Self {
                 maximum_response_bytes: limits.maximum_response_bytes,
-                pending: HashMap::new(),
                 output,
                 responses: responses.clone(),
                 storage: storage.clone(),
                 uncertain: uncertain.clone(),
-                unconfirmed: unconfirmed.clone(),
+                tracking: tracking.clone(),
                 ids: ldap.msgmap.clone(),
             },
             RawHandle {
@@ -291,68 +308,63 @@ impl Driver {
                 responses,
                 storage,
                 uncertain,
-                unconfirmed,
+                tracking,
             },
             RawResponses(receiver),
         )
     }
     pub fn observe_buffers(&self, bytes: usize) {
-        self.storage.store(
-            bytes.saturating_add(
-                self.pending
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<(RequestId, Pending)>() + 32),
-            ),
-            Ordering::Release,
-        );
+        self.storage.store(bytes, Ordering::Release);
     }
     /// One admission point for every raw write, after earlier writes finished.
     /// Replies already decoded and Abandons already flushed need no packet.
     pub fn register(&mut self, id: RequestId, op: &mut RawOperation) -> io::Result<bool> {
-        match op.kind {
-            Kind::Abandon(target) | Kind::Forget(target) => {
-                let forget = matches!(op.kind, Kind::Forget(_));
-                let pending = self.pending.get(&target);
-                if let Some(pending) = pending {
-                    if forget && !matches!(pending.kind, Kind::Search) {
-                        return Err(input("only a search is forgotten"));
+        let no_send = {
+            let mut tracking = self.tracking.lock().expect("LDAP tracking");
+            match op.kind {
+                Kind::Abandon(target) | Kind::Forget(target) => {
+                    let forget = matches!(op.kind, Kind::Forget(_));
+                    let pending = tracking.pending.get(&target);
+                    if let Some(pending) = pending {
+                        if forget && !matches!(pending.kind, Kind::Search) {
+                            return Err(input("only a search is forgotten"));
+                        }
+                    } else if target > self.ids.lock().expect("LDAP identifiers").0 {
+                        return Err(input("LDAP abandon target is not outstanding"));
                     }
-                } else if target > self.ids.lock().expect("LDAP identifiers").0 {
-                    return Err(input("LDAP abandon target is not outstanding"));
+                    if pending.is_none_or(|pending| pending.abandoned || pending.complete) {
+                        if forget {
+                            tracking.forget(target);
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 }
-                if pending.is_none_or(|pending| pending.abandoned || pending.complete) {
-                    if forget {
-                        self.forget(target);
+                Kind::Unbind => false,
+                kind => {
+                    // Submission installed the route before queue acceptance.
+                    // A local forget may already have removed it. Dispatch is
+                    // still owned, but must never recreate forgotten tracking.
+                    if let Some(pending) = tracking.pending.get_mut(&id) {
+                        pending.registered = true;
+                        tracking.unconfirmed.insert(
+                            id,
+                            Unconfirmed {
+                                kind,
+                                _lease: op.lease.clone(),
+                            },
+                        );
                     }
-                    if let Some(reply) = op.written.take() {
-                        let _ = reply.send(Ok(RawWrite::NoSend));
-                    }
-                    return Ok(false);
+                    false
                 }
             }
-            Kind::Unbind => {}
-            kind => {
-                self.unconfirmed
-                    .lock()
-                    .expect("LDAP completion map")
-                    .insert(
-                        id,
-                        Unconfirmed {
-                            _lease: op.lease.clone(),
-                        },
-                    );
-                self.pending.insert(
-                    id,
-                    Pending {
-                        kind,
-                        abandoned: false,
-                        complete: false,
-                        _lease: op.lease.clone(),
-                    },
-                );
-            }
+        };
+        // The callback may call the handle again; never hold tracking here.
+        if no_send && let Some(reply) = op.written.take() {
+            let _ = reply.send(Ok(RawWrite::NoSend));
         }
-        Ok(true)
+        Ok(!no_send)
     }
     pub fn rejected(op: &mut RawOperation, error: io::Error) {
         if let Some(reply) = op.written.take() {
@@ -362,42 +374,33 @@ impl Driver {
     pub fn started(op: &RawOperation) {
         op.dispatched.store(true, Ordering::Release);
     }
-    /// `op` was written. A forgotten search's Abandon frees the search's
-    /// identifier and outstanding slot: the server sends nothing more for it.
+    /// `op` was written. A forgotten search's Abandon frees its tracking.
     pub fn completed(&mut self, op: &mut RawOperation) {
-        match op.kind {
-            Kind::Forget(target) => self.forget(target),
-            Kind::Abandon(target) => {
-                if let Some(pending) = self.pending.get_mut(&target) {
-                    pending.abandoned = true;
+        {
+            let mut tracking = self.tracking.lock().expect("LDAP tracking");
+            match op.kind {
+                Kind::Forget(target) => tracking.forget(target),
+                Kind::Abandon(target) => {
+                    if let Some(pending) = tracking.pending.get_mut(&target) {
+                        pending.abandoned = true;
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
         if let Some(reply) = op.written.take() {
             let _ = reply.send(Ok(RawWrite::Written));
         }
     }
-    fn forget(&mut self, target: RequestId) {
-        if let Some(pending) = self.pending.remove(&target) {
-            pending._lease.release_slot();
-        }
-        if let Some(unconfirmed) = self
-            .unconfirmed
-            .lock()
-            .expect("LDAP completion map")
-            .remove(&target)
-        {
-            // A decoded terminal event may still own the identifier lease.
-            // Forget ends local tracking now; retaining that event continues
-            // to charge response bytes, but cannot retain an ordinary slot.
-            unconfirmed._lease.release_slot();
-        }
-    }
     pub fn response_delivered(&mut self, id: RequestId) {
-        self.pending.remove(&id);
+        self.tracking
+            .lock()
+            .expect("LDAP tracking")
+            .pending
+            .remove(&id);
     }
     pub fn response(&mut self, response: RawResponse) -> io::Result<(bool, usize, Delivery)> {
+        let mut tracking = self.tracking.lock().expect("LDAP tracking");
         let (complete, abandon_requested) = if response.id == 0 {
             if response.operation.id != 24 {
                 return Err(io::Error::new(
@@ -407,7 +410,7 @@ impl Driver {
             }
             (false, false)
         } else {
-            let Some(pending) = self.pending.get_mut(&response.id) else {
+            let Some(pending) = tracking.pending.get_mut(&response.id) else {
                 // An identifier issued and no longer outstanding is a
                 // forgotten search's; one never issued is the server's error.
                 let issued = self.ids.lock().map_or(0, |ids| ids.0);
@@ -419,6 +422,11 @@ impl Driver {
                     "LDAP response has no outstanding message ID",
                 ));
             };
+            if !pending.registered {
+                // As before, an issued id has no response route until the
+                // writer admits it. Queued tracking is only for local forget.
+                return Ok(discarded());
+            }
             let complete = pending.kind.response(response.operation.id)?;
             pending.complete = complete;
             (complete, pending.abandoned)
@@ -432,12 +440,14 @@ impl Driver {
         let output = self.output.clone();
         let id = response.id;
         let completion = if complete {
-            self.pending
+            tracking
+                .pending
                 .get(&id)
-                .map(|pending| (id, self.unconfirmed.clone(), pending._lease.clone()))
+                .map(|pending| (id, self.tracking.clone(), pending._lease.clone()))
         } else {
             None
         };
+        drop(tracking);
         // One decoded response waits outside the queue. The connection driver
         // stops reading further BER frames while this future waits, but keeps
         // its independent writer (including Abandon and Unbind) running.
@@ -461,9 +471,11 @@ impl Driver {
 }
 impl Drop for Driver {
     fn drop(&mut self) {
-        if !self.pending.is_empty() {
+        let mut tracking = self.tracking.lock().expect("LDAP tracking");
+        if tracking.pending.values().any(|pending| pending.registered) {
             self.uncertain.store(true, Ordering::Release);
         }
+        tracking.pending.clear();
     }
 }
 impl RawHandle {
@@ -474,12 +486,17 @@ impl RawHandle {
             .msgmap
             .lock()
             .map_or(0, |ids| ids.1.capacity().saturating_mul(16));
-        let unconfirmed = self
+        let tracking = self.tracking.lock().expect("LDAP tracking");
+        let structural = tracking
             .unconfirmed
-            .lock()
-            .expect("LDAP completion map")
             .capacity()
-            .saturating_mul(std::mem::size_of::<(RequestId, Unconfirmed)>() + 32);
+            .saturating_mul(std::mem::size_of::<(RequestId, Unconfirmed)>() + 32)
+            .saturating_add(
+                tracking
+                    .pending
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(RequestId, Pending)>() + 32),
+            );
         self.limits
             .maximum_request_bytes
             .saturating_sub(self.requests.available_permits())
@@ -490,7 +507,7 @@ impl RawHandle {
             )
             .saturating_add(self.storage.load(Ordering::Acquire))
             .saturating_add(ids)
-            .saturating_add(unconfirmed)
+            .saturating_add(structural)
     }
     /// Queue one operation without waiting for a response. All in-flight and
     /// queued operations share limits, including calls made through clones.
@@ -502,6 +519,37 @@ impl RawHandle {
     ) -> io::Result<RawDispatch> {
         let kind = Kind::from_tag(&operation)?;
         self.dispatch(kind, operation, controls)
+    }
+    /// Forget a search's local correlation and outstanding slot immediately.
+    /// This sends no packet and reserves no request bytes. It does not undo a
+    /// queued or in-flight write. Existing response events keep their bytes and
+    /// identifier leases; subsequent responses for the search are discarded.
+    ///
+    /// When notifying the peer, use `forget()` and await its write first, then
+    /// call this even if notification admission or the write failed. Calling
+    /// this first makes a later `forget()` a no-send. An already retired search
+    /// is a no-op; an unissued id or a tracked non-search is rejected.
+    pub fn forget_local(&mut self, search: RequestId) -> io::Result<()> {
+        let mut tracking = self.tracking.lock().expect("LDAP tracking");
+        let issued = self.ldap.msgmap.lock().expect("LDAP identifiers").0;
+        if search <= 0 || search > issued {
+            return Err(input("LDAP forget target was not issued"));
+        }
+        let kind = tracking
+            .pending
+            .get(&search)
+            .map(|pending| pending.kind)
+            .or_else(|| {
+                tracking
+                    .unconfirmed
+                    .get(&search)
+                    .map(|pending| pending.kind)
+            });
+        if kind.is_some_and(|kind| !matches!(kind, Kind::Search)) {
+            return Err(input("only a search is forgotten"));
+        }
+        tracking.forget(search);
+        Ok(())
     }
     /// Abandons the outstanding search `search` and forgets it once the
     /// Abandon is written, as ldapts forgets an abandoned message: its
@@ -548,6 +596,18 @@ impl RawHandle {
             ids: self.ldap.msgmap.clone(),
             slot: Mutex::new(slot),
         });
+        if matches!(kind, Kind::Reply(_) | Kind::Search) {
+            self.tracking.lock().expect("LDAP tracking").pending.insert(
+                id,
+                Pending {
+                    kind,
+                    abandoned: false,
+                    complete: false,
+                    registered: false,
+                    _lease: lease.clone(),
+                },
+            );
+        }
         let (written, receipt) = oneshot::channel();
         let dispatched = Arc::new(AtomicBool::new(false));
         let raw = RawOperation {
@@ -558,7 +618,8 @@ impl RawHandle {
             dispatched: dispatched.clone(),
         };
         let (reply, _) = oneshot::channel();
-        self.ldap
+        if self
+            .ldap
             .tx
             .send((
                 id,
@@ -567,18 +628,66 @@ impl RawHandle {
                 Some(controls),
                 reply,
             ))
-            .map_err(|_| closed())?;
-        Ok(RawDispatch {
-            id,
-            written: receipt,
-            dispatched,
-        })
+            .is_err()
+        {
+            self.tracking.lock().expect("LDAP tracking").forget(id);
+            return Err(closed());
+        }
+        Ok(RawDispatch { id, written: receipt, dispatched })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn local_forget_needs_no_request_bytes_or_driver_progress() {
+        let (stream, _peer) = tokio::io::duplex(128);
+        let limits = DriverLimits {
+            codec: CodecLimits::default(),
+            maximum_outstanding: 1,
+            maximum_request_bytes: 65536,
+            maximum_response_bytes: 65536,
+            maximum_response_items: 1,
+        };
+        let (_conn, mut handle, _events) =
+            crate::LdapConnAsync::from_stream_bounded(stream, limits).unwrap();
+        let search = handle
+            .submit(
+                StructureTag {
+                    class: TagClass::Application,
+                    id: 3,
+                    payload: PL::C(vec![]),
+                },
+                vec![],
+            )
+            .unwrap();
+        let held = handle
+            .requests
+            .clone()
+            .try_acquire_many_owned(handle.requests.available_permits() as u32)
+            .unwrap();
+        assert_eq!(
+            handle.forget(search.id).err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        handle.forget_local(search.id).unwrap();
+        assert_eq!(handle.outstanding.available_permits(), 1);
+        assert_eq!(handle.requests.available_permits(), 0);
+        drop(held);
+        handle
+            .submit(
+                StructureTag {
+                    class: TagClass::Application,
+                    id: 10,
+                    payload: PL::P(b"dc=x".to_vec()),
+                },
+                vec![],
+            )
+            .unwrap();
+    }
+
+
     #[tokio::test]
     async fn dropping_a_queued_operation_keeps_its_receipt_error_and_releases_capacity() {
         use crate::asn1::ASNTag;

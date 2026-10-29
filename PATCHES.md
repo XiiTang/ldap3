@@ -211,3 +211,27 @@ workspace targets passes with default and no-default features; fmt passes.
 The wider no-default example build cannot import the feature-gated LdapConn,
 and strict all-targets Clippy also reports unchanged needless-question-mark
 examples. Those existing example configurations were not repaired or suppressed.
+
+## W17b local search retirement
+
+Selective port of 80903414 onto 607a386e, excluding the conditional 4813bab
+write-completion sink. RawDispatch keeps its original borrowing oneshot
+receiver and the driver keeps its original write/response APIs. Current
+boxed raw operations and bounded response/codec corrections remain.
+
+forget_local retires pending/unconfirmed search tracking without request
+byte admission or any packet, returning its outstanding slot immediately.
+Tracking is shared with RawHandle; a queued writer cannot recreate a locally
+forgotten route. Existing decoded events retain their response bytes and
+identifier leases until their owners drop. Admitted forget still writes
+first; callers invoke local forget after that result or when admission fails.
+
+At upstream 1107b192 conn.rs::turn, Abandon writes before removing search
+tracking; the pinned raw API likewise retired on completed/NoSend only.
+Local retirement is needed when a caller refuses notification admission,
+which otherwise strands the native outstanding slot. It changes no retry,
+timeout or cancellation policy and does not retract accepted writes.
+
+Regression ports: raw::tests::local_forget_needs_no_request_bytes_or_driver_progress
+and runtime_driver::local_forget_* cover queued, active and retained-terminal
+searches, later request progress and no Abandon. Execution pending.
