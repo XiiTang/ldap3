@@ -795,3 +795,58 @@ async fn local_forget_rejects_unissued_ids_and_tracked_updates() {
         let _ = driver.await;
     }
 }
+
+/// A response already buffered behind the reply that completed a `drive_one`
+/// exchange is decoded by the next turn without waiting for more bytes.
+#[tokio::test]
+async fn a_response_buffered_behind_a_completed_exchange_is_delivered_by_the_next_turn() {
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let (conn, mut handle, mut events) =
+        LdapConnAsync::from_stream_bounded(stream, limits()).unwrap();
+    let mut dispatch = handle.submit(delete(), vec![]).unwrap();
+    let exchange = tokio::spawn(conn.drive_one());
+    request(&mut peer).await;
+    // The reply and a Notice of Disconnection (message ID 0) in one write.
+    let mut bytes = vec![
+        0x30,
+        12,
+        2,
+        1,
+        dispatch.id as u8,
+        0x6b,
+        7,
+        10,
+        1,
+        0,
+        4,
+        0,
+        4,
+        0,
+    ];
+    bytes.extend_from_slice(&[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x78, 0x29, 0x0a, 0x01, 0x34, 0x04, 0x00, 0x04, 0x0a,
+    ]);
+    bytes.extend_from_slice(b"going down");
+    bytes.extend_from_slice(&[0x8a, 0x16]);
+    bytes.extend_from_slice(b"1.3.6.1.4.1.1466.20036");
+    peer.write_all(&bytes).await.unwrap();
+    let conn = exchange.await.unwrap().unwrap();
+    dispatch.written().await.unwrap();
+    let mut reply = events.recv().await.unwrap();
+    assert!(reply.complete);
+    assert_eq!(reply.response.id, dispatch.id);
+    reply.confirm();
+    let driver = tokio::spawn(conn.drive());
+    // The peer stays open and sends nothing more.
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .expect("the buffered Notice is decoded without further bytes")
+        .unwrap();
+    assert_eq!(notice.response.id, 0);
+    assert_eq!(notice.response.operation.id, 24);
+    assert!(!notice.complete);
+    assert!(!driver.is_finished());
+    driver.abort();
+    let _ = driver.await;
+    drop(peer);
+}

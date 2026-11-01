@@ -891,8 +891,15 @@ impl LdapConnAsync {
         } = self;
         let parts = stream.into_parts();
         let (read_half, write_half) = io::split(parts.io);
-        let mut reader = tokio_util::codec::FramedRead::new(read_half, parts.codec.clone());
-        *reader.read_buffer_mut() = parts.read_buf;
+        // Restore the read half through `from_parts`, as upstream keeps one
+        // `Framed`: bytes buffered by the previous turn are decoded before the
+        // transport is polled again.
+        let mut read = tokio_util::codec::FramedParts::new::<(RequestId, Tag, MaybeControls)>(
+            read_half,
+            parts.codec.clone(),
+        );
+        read.read_buf = parts.read_buf;
+        let mut reader = Framed::from_parts(read);
         let mut initial_writer = tokio_util::codec::FramedWrite::new(write_half, parts.codec);
         *initial_writer.write_buffer_mut() = parts.write_buf;
         type Writer = tokio_util::codec::FramedWrite<io::WriteHalf<ConnType>, LdapCodec>;

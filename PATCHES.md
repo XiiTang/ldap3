@@ -258,3 +258,40 @@ W17b selective-port validation on macOS arm64, consumer Rust 1.97.0:
 local_forget` passes all three new real driver cases (exit 0); strict
 `cargo clippy --no-default-features --features sync --lib --tests --
 -D warnings` also passes (exit 0). No write-receipt sink is included.
+
+## Buffered responses decoded at each driver turn (Boundless #433)
+
+`turn` splits the transport into read and write halves on entry, so a
+blocked write cannot pause response parsing, and rejoins them into one
+`Framed` when a `SingleOp` turn ends, so `into_stream` and
+`into_security_stream` can recover the exact transport. The reader was
+rebuilt with `FramedRead::new` and then given the previous turn's leftover
+bytes through `read_buffer_mut`. `FramedRead::new` starts with tokio-util's
+`is_readable = false`, and replacing the buffer leaves that flag unchanged,
+so the reader polled the transport before decoding frames that were already
+buffered. A response that arrived in the same read as the reply ending a
+`drive_one` exchange, such as a Notice of Disconnection, was therefore
+decoded only when more bytes or EOF arrived. A peer that sends its Notice
+and keeps the transport open left the connection waiting until the caller's
+bound expired.
+
+Upstream v0.12.1 keeps one `Framed<ConnType, LdapCodec>` in `self.stream`
+for the connection's life and reads it with `self.stream.next()`
+(`conn.rs:826`), so its readable state is never rebuilt. The patch keeps the
+split and the exit rejoin. It builds the read half as the `Framed` type
+upstream uses, through `Framed::from_parts`, the same constructor the exit
+rejoin already uses. `From<BytesMut> for ReadFrame` sets
+`is_readable = !buffer.is_empty()`, so buffered frames are decoded before
+the transport is polled again. No API changes. The read buffer's capacity
+and `observe_buffers` are unchanged. The read half's `Framed` also holds an
+unused write buffer of tokio-util's initial capacity (8 KiB) while a turn
+runs.
+
+Regression: `runtime_driver::a_response_buffered_behind_a_completed_exchange_is_delivered_by_the_next_turn`
+writes a reply and a Notice in one write, completes `drive_one`, then runs
+`drive` while the peer stays open. On macOS arm64 with Rust 1.97.0 it fails
+without the `conn.rs` change (the Notice is not delivered within its 2 s
+bound; exit 101) and passes with it. With the change, `cargo +1.97.0 test
+--no-default-features --workspace --lib --tests` and `cargo +1.97.0 test
+--workspace` pass (exit 0), as does strict `cargo +1.97.0 clippy
+--no-default-features --lib --tests --locked -- -D warnings` (exit 0).
