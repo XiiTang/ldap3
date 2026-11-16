@@ -82,6 +82,15 @@ impl RequestLimit {
         )
     }
 }
+/// A response whose BER header announces a frame longer than
+/// [`CodecLimits::maximum_frame`], carried as an `InvalidData` I/O error
+/// source. The decoder refuses it before reading or allocating its body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("LDAP response frame exceeds the {maximum}-byte limit")]
+pub struct ResponseFrameLimit {
+    pub maximum: usize,
+}
+
 fn request_limit(kind: RequestLimitKind, maximum: usize) -> RequestLimit {
     RequestLimit {
         kind,
@@ -194,7 +203,12 @@ fn decode_inner(buf: &mut BytesMut, limits: CodecLimits) -> io::Result<Option<Ra
     };
     let length = header.checked_add(payload).ok_or_else(invalid)?;
     if length > limits.maximum_frame {
-        return Err(invalid());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            ResponseFrameLimit {
+                maximum: limits.maximum_frame,
+            },
+        ));
     }
     if buf.len() < length {
         return Ok(None);

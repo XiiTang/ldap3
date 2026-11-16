@@ -295,3 +295,38 @@ bound; exit 101) and passes with it. With the change, `cargo +1.97.0 test
 --no-default-features --workspace --lib --tests` and `cargo +1.97.0 test
 --workspace` pass (exit 0), as does strict `cargo +1.97.0 clippy
 --no-default-features --lib --tests --locked -- -D warnings` (exit 0).
+
+## Response frame limit as a typed source (Boundless batch D, F8)
+
+The decoder already refuses a response whose BER header announces a frame
+longer than `CodecLimits::maximum_frame`, before reading or allocating its
+body. It returned the same `InvalidData` "invalid LDAP envelope" error as a
+malformed envelope, so Runtime answered a response past its read limit as a
+malformed reply (`protocol_response_invalid`), and the program was told the
+server sent bad BER instead of that the reply passed a limit it can raise.
+
+Only that comparison changes: it returns `ResponseFrameLimit { maximum }` as
+the source of an `InvalidData` I/O error, following `RequestLimit` and
+`OutstandingLimit`. Every other decoder refusal, including the GSSAPI wrapped
+length check, keeps the generic envelope error. The kind is unchanged, so a
+caller that reads only the kind sees what it saw before.
+
+Upstream v0.12.1 has no response frame limit: `decode_inner` asks
+`lber::Parser` for a complete tag and returns `Ok(None)` while it is
+incomplete, so the buffer grows until the announced frame arrives; any
+decoding failure is one `io::ErrorKind::Other` "decoding error". The limit
+is the fork's (see "The existing lber parser checks frame ... limits"
+above); this patch only names it.
+
+Regression: `runtime_codec::a_response_past_the_frame_limit_is_that_limit_before_its_body_arrives`
+decodes a 4-byte header announcing 260 bytes against an 8-byte limit and
+asserts the typed source with its maximum, that nothing was consumed, and
+that a malformed frame within the limit carries no such source. On macOS
+arm64 with Rust 1.97.0 it fails without the `protocol.rs` change (exit 101)
+and passes with it. With the change, `cargo +1.97.0 test --no-default-features
+--workspace --lib --tests --locked` and `cargo +1.97.0 test --workspace
+--locked` pass (exit 0), as do strict `cargo +1.97.0 clippy
+--no-default-features --lib --tests --locked -- -D warnings` and `cargo fmt
+--all --check`. Runtime maps the source to `limit_exceeded {message_bytes}`
+in `ldap::library_failure`; its test is
+`protocols::ldap::tests::a_result_past_the_message_limit_is_that_limit`.

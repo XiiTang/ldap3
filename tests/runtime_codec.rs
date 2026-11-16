@@ -38,15 +38,36 @@ fn malformed_peer_envelopes_and_controls_fail_without_panicking_or_consuming() {
         assert!(codec.decode(&mut input).is_err(), "{wire:?}");
         assert_eq!(input.as_ref(), wire);
     }
+}
+#[test]
+fn a_response_past_the_frame_limit_is_that_limit_before_its_body_arrives() {
     let mut codec = LdapCodec::new(CodecLimits {
         maximum_frame: 8,
         ..Default::default()
     })
     .unwrap();
+    // The header alone announces 260 bytes; none of the body has arrived.
+    let wire = [0x30, 0x82, 1, 0];
+    let mut input = BytesMut::from(&wire[..]);
+    let Err(error) = codec.decode(&mut input) else {
+        panic!("a frame past the limit was decoded")
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<ldap3::ResponseFrameLimit>()),
+        Some(&ldap3::ResponseFrameLimit { maximum: 8 })
+    );
+    assert_eq!(input.as_ref(), wire);
+    // A frame within the limit that is malformed stays an invalid envelope.
+    let Err(error) = codec.decode(&mut BytesMut::from(&[0x30, 0][..])) else {
+        panic!("a malformed frame was decoded")
+    };
     assert!(
-        codec
-            .decode(&mut BytesMut::from(&[0x30, 0x82, 1, 0][..]))
-            .is_err()
+        error
+            .get_ref()
+            .is_none_or(|source| !source.is::<ldap3::ResponseFrameLimit>())
     );
 }
 #[tokio::test]
