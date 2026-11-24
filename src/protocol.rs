@@ -284,6 +284,14 @@ impl Decoder for LdapCodec {
     type Item = RawResponse;
     type Error = io::Error;
 
+    fn decode_eof(&mut self, buf: &mut BytesMut) -> io::Result<Option<Self::Item>> {
+        match self.decode(buf)? {
+            Some(response) => Ok(Some(response)),
+            None if buf.is_empty() => Ok(None),
+            None => Err(io::ErrorKind::UnexpectedEof.into()),
+        }
+    }
+
     #[cfg(not(feature = "gssapi"))]
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         decode_inner(buf, self.limits)

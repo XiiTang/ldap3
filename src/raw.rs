@@ -284,6 +284,14 @@ pub(crate) struct Driver {
     ids: Arc<Mutex<(RequestId, HashSet<RequestId>)>>,
 }
 impl Driver {
+    pub(crate) fn result_due_at_eof(&self) -> bool {
+        self.tracking
+            .lock()
+            .expect("LDAP tracking")
+            .pending
+            .values()
+            .any(|pending| !pending.complete && !pending.abandoned)
+    }
     pub fn new(ldap: Ldap, limits: DriverLimits) -> (Self, RawHandle, RawResponses) {
         let (output, receiver) = mpsc::channel(limits.maximum_response_items);
         let uncertain = Arc::new(AtomicBool::new(false));

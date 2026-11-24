@@ -1031,7 +1031,13 @@ impl LdapConnAsync {
                     }
                 },
                 response=reader.next(), if !operation_complete && delivering.is_none()=>{
-                    let Some(response)=response else {return Ok(None);};
+                    let Some(response)=response else {
+                        return match raw.as_ref() {
+                            Some(raw) if raw.result_due_at_eof() => Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
+                            Some(_) => Err(crate::LdapError::EndOfStream),
+                            None => Ok(None),
+                        };
+                    };
                     let response=response?;
                     if let Some(raw)=&mut raw {
                         let (complete, bytes, delivery)=raw.response(response)?;

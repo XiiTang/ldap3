@@ -330,3 +330,11 @@ and passes with it. With the change, `cargo +1.97.0 test --no-default-features
 --all --check`. Runtime maps the source to `limit_exceeded {message_bytes}`
 in `ldap::library_failure`; its test is
 `protocols::ldap::tests::a_result_past_the_message_limit_is_that_limit`.
+
+## Typed receive EOF for unfinished input
+
+Upstream inherits the default decoder EOF error for residual BER and returns a clean turn end for a boundary socket EOF. The patch provides UnexpectedEof for residual BER and for a boundary read while the existing raw request tracker still owes a result. A completed or abandoned request does not count. EndOfStream identifies only the raw boundary with no result due, preserving the old non-raw turn behavior. Boundless retains Unbind/Notice decisions. Queue shutdown and explicit unbind exits keep their current results.
+
+The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is LdapCodec::decode_eof and LdapConnAsync::turn response reader. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regressions are protocols::ldap::tests::a_result_cut_mid_message_ends_the_connection and protocols::ldap::tests::drain::completed_entries_precede_the_receive_cut (a 17th entry cannot postpone the failed end behind a full 16-entry public Reply). These tests are run with the Boundless integration change for #836.
+
+Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.
