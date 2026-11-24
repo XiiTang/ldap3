@@ -405,3 +405,8 @@ waiting for the peer to close. Results are recorded by consuming revision,
 platform and result after the focused and complete pool runs.
 
 No upstream write or fork push is made in this batch.
+
+Native regression result: revision 6a16e2def292d17ac8b637f0faf2845ba704d938,
+macOS arm64, pinned nextest runtime_driver selection with no default features:
+22 passed, exit 0. This covers the native handoff; the Boundless integration
+regressions and shared-owner checks are verified by the consuming fixup.
