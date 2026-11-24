@@ -22,6 +22,8 @@ use cross_krb5::{ClientCtx, K5Ctx};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::codec::{Decoder, Encoder};
 
+const DISCONNECTION_NOTICE: &[u8] = b"1.3.6.1.4.1.1466.20036";
+
 /// Limits used by the single library BER decoder before allocation.
 #[derive(Clone, Copy, Debug)]
 pub struct CodecLimits {
@@ -248,7 +250,7 @@ fn decode_inner(buf: &mut BytesMut, limits: CodecLimits) -> io::Result<Option<Ra
         && trailing.as_ref().is_some_and(|field| {
             field.class == TagClass::Context
                 && field.id == 10
-                && matches!(&field.payload, PL::P(name) if name == b"1.3.6.1.4.1.1466.20036")
+                && matches!(&field.payload, PL::P(name) if name.as_slice() == DISCONNECTION_NOTICE)
         })
     {
         let PL::C(fields) = &mut operation.payload else {
@@ -517,6 +519,23 @@ pub(crate) fn request_allocation(
     Ok(memory)
 }
 impl RawResponse {
+    /// Whether the normalized envelope names a Notice of Disconnection.
+    /// This identifies the reader's handoff, not a validated normal end:
+    /// the consumer must still validate the LDAPResult and other fields.
+    pub fn is_disconnection_notice(&self) -> bool {
+        if self.id != 0 || self.operation.class != TagClass::Application || self.operation.id != 24
+        {
+            return false;
+        }
+        let PL::C(fields) = &self.operation.payload else {
+            return false;
+        };
+        fields.iter().skip(3).rev().find(|field| {
+            field.class == TagClass::Context && field.id == 10
+        }).is_some_and(|field| {
+            matches!(&field.payload, PL::P(name) if name.as_slice() == DISCONNECTION_NOTICE)
+        })
+    }
     pub(crate) fn allocation_bytes(&self) -> io::Result<usize> {
         let mut nodes = usize::MAX;
         let (_, heap) = footprint(

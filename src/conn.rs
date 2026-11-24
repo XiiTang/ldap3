@@ -914,7 +914,7 @@ impl LdapConnAsync {
         let mut writing: Option<Pin<Box<dyn std::future::Future<Output = Completed> + Send>>> =
             None;
         let mut operation_complete = false;
-        let mut delivering: Option<crate::raw::Delivery> = None;
+        let mut delivering: Option<(crate::raw::Delivery, bool)> = None;
         let mut pending_response_bytes = 0;
         loop {
             if let Some(raw) = &raw {
@@ -979,10 +979,16 @@ impl LdapConnAsync {
                         return Ok(None);
                     }
                 },
-                result=async {delivering.as_mut().expect("enabled delivery").await}, if delivering.is_some()=>{
+                result=async {delivering.as_mut().expect("enabled delivery").0.as_mut().await}, if delivering.is_some()=>{
                     if let Some(id)=result? { raw.as_mut().expect("raw driver").response_delivered(id); }
-                    delivering=None;
+                    let (_, ending) = delivering.take().expect("completed delivery");
                     pending_response_bytes=0;
+                    if ending {
+                        // The bounded delivery owns this response now. Let its
+                        // consumer validate the ending message before any FIN,
+                        // trailing frame or dropped writer can replace it.
+                        return Err(crate::LdapError::EndingResponse);
+                    }
                 },
                 req_id=id_scrub_rx.recv()=>{
                     if let Some(id)=req_id {
@@ -1040,8 +1046,9 @@ impl LdapConnAsync {
                     };
                     let response=response?;
                     if let Some(raw)=&mut raw {
+                        let ending = response.is_disconnection_notice();
                         let (complete, bytes, delivery)=raw.response(response)?;
-                        delivering=Some(delivery);
+                        delivering=Some((delivery, ending));
                         pending_response_bytes=bytes;
                         operation_complete=complete && matches!(mode,LoopMode::SingleOp);
                         continue;

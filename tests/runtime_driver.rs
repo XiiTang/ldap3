@@ -845,8 +845,13 @@ async fn a_response_buffered_behind_a_completed_exchange_is_delivered_by_the_nex
     assert_eq!(notice.response.id, 0);
     assert_eq!(notice.response.operation.id, 24);
     assert!(!notice.complete);
-    assert!(!driver.is_finished());
-    driver.abort();
-    let _ = driver.await;
+    assert!(notice.response.is_disconnection_notice());
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .unwrap()
+            .unwrap(),
+        Err(ldap3::LdapError::EndingResponse)
+    ));
     drop(peer);
 }

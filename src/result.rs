@@ -96,6 +96,11 @@ pub enum LdapError {
     #[error("premature end of search stream")]
     EndOfStream,
 
+    /// The raw driver queued a Notice candidate and stopped physical input.
+    /// Validate that queued response before selecting the connection's end.
+    #[error("raw ending response queued for validation")]
+    EndingResponse,
+
     /// URL parsing error.
     #[error("url parse error: {source}")]
     UrlParsing {

@@ -367,3 +367,41 @@ eof_before_the_dispatched_result_retains_the_receive_cut} and
 protocols::ldap::tests::drain::completed_entries_precede_the_receive_cut passed.
 The latter sends 16 or 17 search entries without SearchResultDone, observes the
 failed connection before consumption, then drains the 16 accepted entries.
+
+## Notice handoff before physical EOF
+
+A pending request previously made result_due_at_eof report UnexpectedEof even
+when the same reader had already queued a Notice of Disconnection. The native
+driver could reach FIN before the raw consumer parsed that Notice, so Boundless
+recorded a failed Connection end and discarded the final Notice event.
+
+RawResponse::is_disconnection_notice owns identification of the normalized
+message-ID-zero ExtendedResponse and its final responseName. The decoder's AD
+responseName normalization uses the same OID constant. This predicate identifies
+a handoff candidate, not a semantically checked normal end. The existing bounded
+delivery carries that fact with its one response. Once queued, turn returns
+EndingResponse without reading a later FIN or trailing frame. Boundless drains
+through its existing semantic parser and Terminal: valid Notice is normal Peer;
+invalid LDAPResult fields remain malformed. No pending map is cleared to invent
+request completion, and ordinary unsolicited responses do not stop input.
+
+The preceding upstream read loop ends on stream None. It does not expose the
+raw pending/completion and Notice handoff this integration needs. OpenJDK's
+LdapClient::processUnsolicited parses an ExtendedResponse and force-closes on the
+disconnection OID before continuing socket input. This patch uses that message
+boundary while retaining this fork's bounded raw delivery and the consumer's
+semantic and end owner, rather than moving public delivery into native.
+
+Regression coverage: Boundless
+protocols::ldap::tests::pending_request_notice_and_fin_keeps_the_normal_peer_end
+uses a dispatched pending delete, Notice and FIN (also with an unfinished BER
+suffix) and asserts normal Peer completion, checked cause, final delivery and
+repeated recorded-end reports.
+protocols::ldap::tests::a_notice_candidate_still_requires_a_valid_ldap_result
+covers malformed ending candidates during StartTLS and established operation.
+The unchanged unfinished-search/full-queue controls remain required. The native
+runtime_driver buffered-response/Notice test now checks EndingResponse without
+waiting for the peer to close. Results are recorded by consuming revision,
+platform and result after the focused and complete pool runs.
+
+No upstream write or fork push is made in this batch.
