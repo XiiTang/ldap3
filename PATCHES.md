@@ -338,3 +338,32 @@ Upstream inherits the default decoder EOF error for residual BER and returns a c
 The rule is that a reliable stream ending before required input completes reports a receive cut. The check point is LdapCodec::decode_eof and LdapConnAsync::turn response reader. Boundless converts its typed native evidence through network::failure and keeps existing answer and end selection. The regressions are protocols::ldap::tests::a_result_cut_mid_message_ends_the_connection and protocols::ldap::tests::drain::completed_entries_precede_the_receive_cut (a 17th entry cannot postpone the failed end behind a full 16-entry public Reply). These tests are run with the Boundless integration change for #836.
 
 Upstream submission is deferred under the owner's no-GitHub-writes instruction for this batch.
+
+### Public API and upstream comparison
+
+The public drive result previously returned Ok for both actual boundary EOF and
+normal local completion. The public raw response channel exposes decoded events,
+but not the private pending tracker after events have been decoded and queued.
+Boundless's routes may still await an event already queued by native, so their
+presence is not proof that native owes a result. Draining through a full public
+Reply before deciding EOF waits for the consumer; dropping queued completed
+results to avoid that wait would lose normal completion. The existing native
+tracker already knows complete/abandoned status at the actual read, without a new
+pending-operation registry. Residual BER EOF also needs a typed decoder fact;
+generic Other cannot be globally relabelled.
+
+Injecting an error on every zero read would fail an already completed native result still queued for Boundless, instead of letting its normal end reach the caller. Only the existing native tracker can distinguish that case at this boundary.
+
+Current upstream's reader ends its drive loop on EOF and its codec inherits the
+default decoder EOF error. The patch returns UnexpectedEof for unfinished BER and
+for actual raw boundary EOF only when that existing tracker still owes input.
+EndOfStream otherwise identifies the raw EOF boundary, so Boundless can drain
+already decoded results. Non-raw drive, queue shutdown, completed/abandoned work,
+Unbind and checked Notice retain their existing owners; no replay is added.
+
+Regression evidence: at c401ed6225da0998745f3e6ea0d58d1b17404a39 on macOS arm64,
+Boundless protocols::ldap::tests::{a_result_cut_mid_message_ends_the_connection,
+eof_before_the_dispatched_result_retains_the_receive_cut} and
+protocols::ldap::tests::drain::completed_entries_precede_the_receive_cut passed.
+The latter sends 16 or 17 search entries without SearchResultDone, observes the
+failed connection before consumption, then drains the 16 accepted entries.
